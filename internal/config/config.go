@@ -1,0 +1,346 @@
+// Package config loads and validates application configuration from the
+// process environment.
+//
+// The environment is the single source of configuration truth: there are no
+// config files and no command-line flags. Every other package receives an
+// already-validated Config value, so configuration errors surface once, at
+// startup, instead of at the point of first use.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Environment names the deployment environment the process is running in.
+type Environment string
+
+const (
+	EnvDevelopment Environment = "development"
+	EnvStaging     Environment = "staging"
+	EnvProduction  Environment = "production"
+	EnvTest        Environment = "test"
+)
+
+// IsProduction reports whether the environment demands production safeguards.
+func (e Environment) IsProduction() bool { return e == EnvProduction }
+
+// redacted replaces every secret value in logs and diagnostic output.
+const redacted = "[REDACTED]"
+
+// Config is the fully validated configuration for the API process.
+type Config struct {
+	App      App
+	HTTP     HTTP
+	Postgres Postgres
+	Redis    Redis
+	Kafka    Kafka
+}
+
+// App holds process-level identity and logging settings.
+type App struct {
+	Name        string
+	Environment Environment
+	LogLevel    string
+	LogFormat   string
+}
+
+// HTTP holds the settings for the health/admin HTTP listener.
+type HTTP struct {
+	Host            string
+	Port            int
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	IdleTimeout     time.Duration
+	ShutdownTimeout time.Duration
+}
+
+// Addr returns the host:port the HTTP server binds to.
+func (h HTTP) Addr() string {
+	return net.JoinHostPort(h.Host, strconv.Itoa(h.Port))
+}
+
+// Postgres holds connection settings for the ledger database.
+//
+// No connection is opened in Phase 0; these values are validated so that the
+// persistence phase inherits a known-good configuration surface.
+type Postgres struct {
+	Host            string
+	Port            int
+	User            string
+	Password        string
+	Database        string
+	SSLMode         string
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+}
+
+// DSN renders a libpq-style connection string, including the password.
+// Never log the result; use RedactedDSN instead.
+func (p Postgres) DSN() string { return p.dsn(p.Password) }
+
+// RedactedDSN renders the connection string with the password masked.
+func (p Postgres) RedactedDSN() string { return p.dsn(redacted) }
+
+func (p Postgres) dsn(password string) string {
+	return fmt.Sprintf(
+		"postgres://%s:%s@%s/%s?sslmode=%s",
+		p.User, password, net.JoinHostPort(p.Host, strconv.Itoa(p.Port)), p.Database, p.SSLMode,
+	)
+}
+
+// Redis holds connection settings for the cache/idempotency store.
+type Redis struct {
+	Addr     string
+	Password string
+	DB       int
+}
+
+// Kafka holds connection settings for the audit event stream.
+type Kafka struct {
+	Brokers    []string
+	AuditTopic string
+}
+
+// Redacted returns a copy of the configuration with every secret masked. Use
+// it for any configuration dump that reaches logs or an operator's terminal.
+func (c Config) Redacted() Config {
+	out := c
+	if out.Postgres.Password != "" {
+		out.Postgres.Password = redacted
+	}
+	if out.Redis.Password != "" {
+		out.Redis.Password = redacted
+	}
+	return out
+}
+
+// validSSLModes are the sslmode values libpq accepts.
+var validSSLModes = map[string]bool{
+	"disable": true, "allow": true, "prefer": true,
+	"require": true, "verify-ca": true, "verify-full": true,
+}
+
+var validLogLevels = map[string]bool{
+	"debug": true, "info": true, "warn": true, "error": true,
+}
+
+var validLogFormats = map[string]bool{"json": true, "text": true}
+
+var validEnvironments = map[Environment]bool{
+	EnvDevelopment: true, EnvStaging: true, EnvProduction: true, EnvTest: true,
+}
+
+// Load reads configuration from the process environment, applies defaults for
+// anything unset, and validates the result. It returns every problem it finds
+// rather than only the first, so a misconfigured deployment can be fixed in
+// one pass.
+func Load() (Config, error) { return load(os.LookupEnv) }
+
+// lookupFunc matches os.LookupEnv and lets tests supply an environment without
+// mutating global process state.
+type lookupFunc func(key string) (string, bool)
+
+func load(lookup lookupFunc) (Config, error) {
+	e := &env{lookup: lookup}
+
+	cfg := Config{
+		App: App{
+			Name:        e.str("APP_NAME", "payments-ledger"),
+			Environment: Environment(e.str("APP_ENV", string(EnvDevelopment))),
+			LogLevel:    strings.ToLower(e.str("LOG_LEVEL", "info")),
+			LogFormat:   strings.ToLower(e.str("LOG_FORMAT", "json")),
+		},
+		HTTP: HTTP{
+			Host:            e.str("HTTP_HOST", "0.0.0.0"),
+			Port:            e.intVal("HTTP_PORT", 8080),
+			ReadTimeout:     e.duration("HTTP_READ_TIMEOUT", 5*time.Second),
+			WriteTimeout:    e.duration("HTTP_WRITE_TIMEOUT", 10*time.Second),
+			IdleTimeout:     e.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
+			ShutdownTimeout: e.duration("HTTP_SHUTDOWN_TIMEOUT", 15*time.Second),
+		},
+		Postgres: Postgres{
+			Host:            e.str("POSTGRES_HOST", "localhost"),
+			Port:            e.intVal("POSTGRES_PORT", 5432),
+			User:            e.str("POSTGRES_USER", "ledger"),
+			Password:        e.str("POSTGRES_PASSWORD", "ledger"),
+			Database:        e.str("POSTGRES_DB", "ledger"),
+			SSLMode:         e.str("POSTGRES_SSLMODE", "disable"),
+			MaxOpenConns:    e.intVal("POSTGRES_MAX_OPEN_CONNS", 25),
+			MaxIdleConns:    e.intVal("POSTGRES_MAX_IDLE_CONNS", 25),
+			ConnMaxLifetime: e.duration("POSTGRES_CONN_MAX_LIFETIME", 30*time.Minute),
+		},
+		Redis: Redis{
+			Addr:     e.str("REDIS_ADDR", "localhost:6379"),
+			Password: e.str("REDIS_PASSWORD", ""),
+			DB:       e.intVal("REDIS_DB", 0),
+		},
+		Kafka: Kafka{
+			Brokers:    e.list("KAFKA_BROKERS", []string{"localhost:29092"}),
+			AuditTopic: e.str("KAFKA_AUDIT_TOPIC", "ledger.audit.v1"),
+		},
+	}
+
+	problems := append(e.errs, cfg.validate()...)
+	if len(problems) > 0 {
+		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(problems...))
+	}
+	return cfg, nil
+}
+
+func (c Config) validate() []error {
+	var errs []error
+
+	fail := func(format string, args ...any) {
+		errs = append(errs, fmt.Errorf(format, args...))
+	}
+
+	if strings.TrimSpace(c.App.Name) == "" {
+		fail("APP_NAME must not be empty")
+	}
+	if !validEnvironments[c.App.Environment] {
+		fail("APP_ENV %q must be one of development, staging, production, test", c.App.Environment)
+	}
+	if !validLogLevels[c.App.LogLevel] {
+		fail("LOG_LEVEL %q must be one of debug, info, warn, error", c.App.LogLevel)
+	}
+	if !validLogFormats[c.App.LogFormat] {
+		fail("LOG_FORMAT %q must be one of json, text", c.App.LogFormat)
+	}
+
+	if c.HTTP.Host == "" {
+		fail("HTTP_HOST must not be empty")
+	}
+	// Port 0 is allowed: it asks the kernel for an ephemeral port, which the
+	// integration tests rely on.
+	if c.HTTP.Port < 0 || c.HTTP.Port > 65535 {
+		fail("HTTP_PORT %d must be between 0 and 65535", c.HTTP.Port)
+	}
+	for _, d := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"HTTP_READ_TIMEOUT", c.HTTP.ReadTimeout},
+		{"HTTP_WRITE_TIMEOUT", c.HTTP.WriteTimeout},
+		{"HTTP_IDLE_TIMEOUT", c.HTTP.IdleTimeout},
+		{"HTTP_SHUTDOWN_TIMEOUT", c.HTTP.ShutdownTimeout},
+	} {
+		if d.value <= 0 {
+			fail("%s must be greater than zero, got %s", d.name, d.value)
+		}
+	}
+
+	if c.Postgres.Host == "" {
+		fail("POSTGRES_HOST must not be empty")
+	}
+	if c.Postgres.Port < 1 || c.Postgres.Port > 65535 {
+		fail("POSTGRES_PORT %d must be between 1 and 65535", c.Postgres.Port)
+	}
+	if c.Postgres.User == "" {
+		fail("POSTGRES_USER must not be empty")
+	}
+	if c.Postgres.Database == "" {
+		fail("POSTGRES_DB must not be empty")
+	}
+	if !validSSLModes[c.Postgres.SSLMode] {
+		fail("POSTGRES_SSLMODE %q is not a valid libpq sslmode", c.Postgres.SSLMode)
+	}
+	if c.Postgres.MaxOpenConns < 1 {
+		fail("POSTGRES_MAX_OPEN_CONNS %d must be at least 1", c.Postgres.MaxOpenConns)
+	}
+	if c.Postgres.MaxIdleConns < 0 {
+		fail("POSTGRES_MAX_IDLE_CONNS %d must not be negative", c.Postgres.MaxIdleConns)
+	}
+	if c.Postgres.MaxIdleConns > c.Postgres.MaxOpenConns {
+		fail("POSTGRES_MAX_IDLE_CONNS %d must not exceed POSTGRES_MAX_OPEN_CONNS %d",
+			c.Postgres.MaxIdleConns, c.Postgres.MaxOpenConns)
+	}
+	if c.Postgres.ConnMaxLifetime < 0 {
+		fail("POSTGRES_CONN_MAX_LIFETIME must not be negative, got %s", c.Postgres.ConnMaxLifetime)
+	}
+	if c.App.Environment.IsProduction() && c.Postgres.SSLMode == "disable" {
+		fail("POSTGRES_SSLMODE must not be 'disable' when APP_ENV is production")
+	}
+
+	if c.Redis.Addr == "" {
+		fail("REDIS_ADDR must not be empty")
+	}
+	if c.Redis.DB < 0 {
+		fail("REDIS_DB %d must not be negative", c.Redis.DB)
+	}
+
+	if len(c.Kafka.Brokers) == 0 {
+		fail("KAFKA_BROKERS must list at least one broker")
+	}
+	if c.Kafka.AuditTopic == "" {
+		fail("KAFKA_AUDIT_TOPIC must not be empty")
+	}
+
+	return errs
+}
+
+// env reads typed values from a lookup function, accumulating parse errors so
+// that a single Load reports every malformed variable at once.
+type env struct {
+	lookup lookupFunc
+	errs   []error
+}
+
+func (e *env) str(key, def string) string {
+	if v, ok := e.lookup(key); ok {
+		return v
+	}
+	return def
+}
+
+func (e *env) intVal(key string, def int) int {
+	raw, ok := e.lookup(key)
+	if !ok || raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		e.errs = append(e.errs, fmt.Errorf("%s: %q is not an integer", key, raw))
+		return def
+	}
+	return v
+}
+
+func (e *env) duration(key string, def time.Duration) time.Duration {
+	raw, ok := e.lookup(key)
+	if !ok || raw == "" {
+		return def
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil {
+		e.errs = append(e.errs, fmt.Errorf("%s: %q is not a duration (e.g. 5s, 30m)", key, raw))
+		return def
+	}
+	return v
+}
+
+// list splits a comma-separated variable, trimming whitespace and dropping
+// empty entries.
+func (e *env) list(key string, def []string) []string {
+	raw, ok := e.lookup(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return def
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
+}

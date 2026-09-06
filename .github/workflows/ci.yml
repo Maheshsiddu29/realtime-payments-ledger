@@ -75,6 +75,65 @@ jobs:
           path: coverage.out
           retention-days: 7
 
+  integration:
+    name: PostgreSQL integration tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+          POSTGRES_DB: ledger
+        ports:
+          - 5432:5432
+        # The job must not start querying before the server accepts
+        # connections, and a service container has no depends_on.
+        options: >-
+          --health-cmd "pg_isready -U ledger -d ledger"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_SSLMODE: disable
+      # A dedicated database, created and migrated by the test harness, so a
+      # test run can never touch application data.
+      POSTGRES_TEST_DB: ledger_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Proves both directions of every migration before anything relies on
+      # the schema.
+      - name: Migrate up, down and up again
+        # Runs against the 'ledger' database created by the service container.
+        # The integration tests use their own POSTGRES_TEST_DB, so the two do
+        # not interfere.
+        run: |
+          go run ./cmd/migrate up
+          go run ./cmd/migrate version
+          go run ./cmd/migrate down-all
+          go run ./cmd/migrate up
+          go run ./cmd/migrate version
+
+      - name: Integration tests
+        run: make test-integration
+
+      - name: Integration tests with race detector
+        run: make test-integration-race
+
   compose:
     name: Validate Compose stack
     runs-on: ubuntu-latest
@@ -109,20 +168,43 @@ jobs:
           cache-to: type=gha,mode=max
 
       # A container that cannot answer its own liveness probe is not shippable.
+      #
+      # No database is attached to this job, which makes it the end-to-end
+      # proof of the readiness contract: liveness must stay 200 while
+      # readiness reports 503, so a dependency outage withholds traffic
+      # without triggering a restart loop.
       - name: Smoke test the image
         run: |
+          set -euo pipefail
           docker run -d --name api-smoke -p 8080:8080 payments-ledger/api:ci
+          trap 'docker logs api-smoke || true; docker rm -f api-smoke || true' EXIT
+
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/healthz; then
-              echo "healthz OK"
-              curl -fsS http://127.0.0.1:8080/readyz && echo "readyz OK"
-              curl -fsS http://127.0.0.1:8080/version && echo "version OK"
-              docker rm -f api-smoke
-              exit 0
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null; then
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "API container never answered /healthz"
+              exit 1
             fi
             sleep 1
           done
-          echo "API container never became healthy"
-          docker logs api-smoke
-          docker rm -f api-smoke
-          exit 1
+          echo "liveness: 200 as expected"
+
+          curl -fsS http://127.0.0.1:8080/version >/dev/null
+          echo "version: 200 as expected"
+
+          ready_status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/readyz)
+          if [ "$ready_status" != "503" ]; then
+            echo "readiness returned $ready_status, want 503 with no database attached"
+            exit 1
+          fi
+          echo "readiness: 503 as expected with no database attached"
+
+          live_status=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz)
+          if [ "$live_status" != "200" ]; then
+            echo "liveness returned $live_status while unready, want 200"
+            exit 1
+          fi
+          echo "liveness stayed 200 while unready"
+

@@ -17,6 +17,11 @@ LDFLAGS := -s -w \
 
 GO_PACKAGES := ./...
 
+# Integration tests are guarded by the `integration` build tag, so the default
+# `go test ./...` needs no infrastructure and stays fast. Anything tagged
+# requires a running PostgreSQL (make infra-up).
+INTEGRATION_TAG := integration
+
 .DEFAULT_GOAL := help
 
 ## help: List the available targets.
@@ -48,10 +53,11 @@ fmt-check:
 	fi
 	@echo "gofmt: clean"
 
-## vet: Run go vet across the module.
+## vet: Run go vet across the module, including integration-tagged files.
 .PHONY: vet
 vet:
 	go vet $(GO_PACKAGES)
+	go vet -tags=$(INTEGRATION_TAG) $(GO_PACKAGES)
 
 ## tidy: Reconcile go.mod and go.sum with the imports in the tree.
 .PHONY: tidy
@@ -77,15 +83,29 @@ tidy-check:
 # Tests
 # ---------------------------------------------------------------------------
 
-## test: Run the unit and end-to-end test suites.
+## test: Run the fast suites (no infrastructure required).
 .PHONY: test
 test:
 	go test $(GO_PACKAGES)
 
-## test-race: Run the test suites with the race detector enabled.
+## test-race: Run the fast suites with the race detector enabled.
 .PHONY: test-race
 test-race:
 	go test -race $(GO_PACKAGES)
+
+## test-integration: Run the PostgreSQL integration tests (needs make infra-up).
+.PHONY: test-integration
+test-integration:
+	go test -tags=$(INTEGRATION_TAG) -count=1 $(GO_PACKAGES)
+
+## test-integration-race: Integration tests under the race detector.
+.PHONY: test-integration-race
+test-integration-race:
+	go test -tags=$(INTEGRATION_TAG) -race -count=1 $(GO_PACKAGES)
+
+## test-all: Run every suite, fast and integration.
+.PHONY: test-all
+test-all: test test-integration
 
 ## cover: Produce coverage.out and a human-readable summary.
 .PHONY: cover
@@ -124,6 +144,42 @@ run:
 .PHONY: clean
 clean:
 	rm -rf $(BIN_DIR) coverage.out coverage.html
+
+# ---------------------------------------------------------------------------
+# Database migrations
+# ---------------------------------------------------------------------------
+#
+# Migrations are an explicit operator step. The API process never migrates on
+# start-up. Connection settings come from the POSTGRES_* environment variables.
+
+## migrate-up: Apply all pending migrations.
+.PHONY: migrate-up
+migrate-up:
+	go run ./cmd/migrate up
+
+## migrate-down: Roll back exactly one migration.
+.PHONY: migrate-down
+migrate-down:
+	go run ./cmd/migrate down
+
+## migrate-down-all: Roll back every migration (destroys all data).
+.PHONY: migrate-down-all
+migrate-down-all:
+	go run ./cmd/migrate down-all
+
+## migrate-version: Print the current schema version.
+.PHONY: migrate-version
+migrate-version:
+	go run ./cmd/migrate version
+
+## migrate-redo: Roll everything back and re-apply, verifying both directions.
+.PHONY: migrate-redo
+migrate-redo: migrate-down-all migrate-up
+
+## psql: Open a psql shell against the configured database.
+.PHONY: psql
+psql:
+	$(COMPOSE) exec postgres psql -U $${POSTGRES_USER:-ledger} -d $${POSTGRES_DB:-ledger}
 
 # ---------------------------------------------------------------------------
 # Local infrastructure
@@ -183,6 +239,8 @@ docker-build:
 ci: fmt-check vet build test test-race
 	@echo "All checks passed."
 
-## verify: Run the CI gate plus Compose validation.
+## verify: Full verification: the CI gate, Compose validation and integration tests.
 .PHONY: verify
-verify: ci compose-config
+verify: ci compose-config test-integration
+	@echo "Full verification passed."
+

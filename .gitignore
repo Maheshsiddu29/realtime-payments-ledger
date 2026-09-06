@@ -1,0 +1,30 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.out
+*.test
+
+# Go workspace / vendor
+/vendor/
+go.work
+go.work.sum
+
+# Test & coverage artifacts
+coverage.out
+coverage.html
+*.prof
+
+# Local environment (never commit real credentials)
+.env
+.env.*
+!.env.example
+
+# Local data volumes
+/.data/
+
+# Editor & OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

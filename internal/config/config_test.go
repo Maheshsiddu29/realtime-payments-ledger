@@ -38,6 +38,9 @@ func TestLoadDefaults(t *testing.T) {
 	if got, want := cfg.Postgres.Database, "ledger"; got != want {
 		t.Errorf("Postgres.Database = %q, want %q", got, want)
 	}
+	if got, want := cfg.Postgres.ConnectTimeout, 10*time.Second; got != want {
+		t.Errorf("Postgres.ConnectTimeout = %s, want %s", got, want)
+	}
 	if got, want := len(cfg.Kafka.Brokers), 1; got != want {
 		t.Fatalf("len(Kafka.Brokers) = %d, want %d", got, want)
 	}
@@ -153,6 +156,11 @@ func TestLoadValidationErrors(t *testing.T) {
 				"POSTGRES_SSLMODE": "disable",
 			},
 			wantMsg: "must not be 'disable' when APP_ENV is production",
+		},
+		{
+			name:    "non-positive connect timeout",
+			env:     map[string]string{"POSTGRES_CONNECT_TIMEOUT": "0s"},
+			wantMsg: "POSTGRES_CONNECT_TIMEOUT",
 		},
 		{
 			name:    "negative redis database",

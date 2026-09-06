@@ -79,6 +79,10 @@ type Postgres struct {
 	MaxOpenConns    int
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
+	// ConnectTimeout bounds the initial connection and its verifying ping, so
+	// a wedged or unreachable database fails start-up promptly instead of
+	// hanging the process.
+	ConnectTimeout time.Duration
 }
 
 // DSN renders a libpq-style connection string, including the password.
@@ -175,6 +179,7 @@ func load(lookup lookupFunc) (Config, error) {
 			MaxOpenConns:    e.intVal("POSTGRES_MAX_OPEN_CONNS", 25),
 			MaxIdleConns:    e.intVal("POSTGRES_MAX_IDLE_CONNS", 25),
 			ConnMaxLifetime: e.duration("POSTGRES_CONN_MAX_LIFETIME", 30*time.Minute),
+			ConnectTimeout:  e.duration("POSTGRES_CONNECT_TIMEOUT", 10*time.Second),
 		},
 		Redis: Redis{
 			Addr:     e.str("REDIS_ADDR", "localhost:6379"),
@@ -263,6 +268,9 @@ func (c Config) validate() []error {
 	}
 	if c.Postgres.ConnMaxLifetime < 0 {
 		fail("POSTGRES_CONN_MAX_LIFETIME must not be negative, got %s", c.Postgres.ConnMaxLifetime)
+	}
+	if c.Postgres.ConnectTimeout <= 0 {
+		fail("POSTGRES_CONNECT_TIMEOUT must be greater than zero, got %s", c.Postgres.ConnectTimeout)
 	}
 	if c.App.Environment.IsProduction() && c.Postgres.SSLMode == "disable" {
 		fail("POSTGRES_SSLMODE must not be 'disable' when APP_ENV is production")

@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to a branch cancels the run still in flight for it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Fail the build on a download that silently falls back to a proxy mirror.
+  GOTOOLCHAIN: local
+
+jobs:
+  lint:
+    name: Format and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Single source of truth for the toolchain version.
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: make fmt-check
+
+      - name: go vet
+        run: make vet
+
+      - name: go mod tidy is up to date
+        run: make tidy-check
+
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+      # The ledger's correctness depends on concurrent behaviour, so the race
+      # detector is a required check rather than an optional one.
+      - name: Test with race detector
+        run: make test-race
+
+      - name: Coverage
+        run: make cover
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  compose:
+    name: Validate Compose stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker compose config
+        run: docker compose config --quiet
+
+  image:
+    name: Build container image
+    runs-on: ubuntu-latest
+    # No point building an image from a tree that does not compile or pass.
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: payments-ledger/api:ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A container that cannot answer its own liveness probe is not shippable.
+      - name: Smoke test the image
+        run: |
+          docker run -d --name api-smoke -p 8080:8080 payments-ledger/api:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz; then
+              echo "healthz OK"
+              curl -fsS http://127.0.0.1:8080/readyz && echo "readyz OK"
+              curl -fsS http://127.0.0.1:8080/version && echo "version OK"
+              docker rm -f api-smoke
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API container never became healthy"
+          docker logs api-smoke
+          docker rm -f api-smoke
+          exit 1

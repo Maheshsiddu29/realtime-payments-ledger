@@ -11,26 +11,33 @@ mechanism (liveness/readiness), graceful shutdown, Docker Compose stack
 
 No business domain, no database driver, no external clients.
 
-## Phase 1 — Persistence and the double-entry core
+## Phase 1 — Persistence and the double-entry core ✅ complete
 
 Database connectivity and the accounting schema.
 
-- PostgreSQL driver and connection pool wired to the existing config.
-- Migration runner and the first migrations: `accounts`, `transfers`,
-  `ledger_entries`.
-- Amounts as `BIGINT` minor units with an explicit currency; a database
-  constraint enforcing that every transfer's entries sum to zero.
+- pgx connection pool wired to the existing configuration, with a bounded
+  connect timeout.
+- `cmd/migrate` plus four versioned up/down migrations: `accounts`,
+  `transfers`, `ledger_entries`, and the balance-invariant triggers.
+- Amounts as `BIGINT` minor units with an explicit currency; deferred
+  constraint triggers enforcing that every transfer's entries sum to zero.
 - A PostgreSQL readiness check registered with `internal/health`, turning
   `/readyz` into a real signal.
-- Repository layer with integration tests against a real PostgreSQL instance.
+- Repository layer and atomic transfer posting, with integration tests against
+  a real PostgreSQL instance and a CI job to run them.
+
+Explicitly **not** done in this phase: concurrency hardening. See
+[LEDGER_DESIGN.md](LEDGER_DESIGN.md#transaction-isolation-honestly).
 
 ## Phase 2 — Transfers under concurrency
 
-- Transfer service performing balanced double-entry writes.
-- `SERIALIZABLE` transactions with retry on serialization failure (`40001`).
-- Row-level locking with a deterministic lock ordering to avoid deadlocks.
+- Deterministic account lock ordering (`SELECT ... FOR UPDATE` in a fixed
+  order) so concurrent transfers over the same pair cannot deadlock.
+- A bounded retry loop on serialization failure (SQLSTATE `40001`), which
+  Phase 1 surfaces to the caller as an error.
 - Concurrency tests: parallel transfers over the same accounts must never
-  produce a negative balance or a lost update.
+  produce a negative balance, a lost update or a double spend.
+- Load testing to characterise throughput and retry rates under contention.
 
 ## Phase 3 — Idempotency
 

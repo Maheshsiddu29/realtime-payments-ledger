@@ -32,8 +32,8 @@ Durations use Go syntax: `5s`, `500ms`, `30m`.
 
 ## PostgreSQL
 
-Validated but **not yet connected to**; the driver arrives with the
-persistence phase.
+Live: the application connects to PostgreSQL using these settings and reports
+itself unready while the database is unreachable.
 
 | Variable                     | Default     | Description                                  |
 | ---------------------------- | ----------- | -------------------------------------------- |
@@ -46,8 +46,21 @@ persistence phase.
 | `POSTGRES_MAX_OPEN_CONNS`    | `25`        | Pool ceiling.                                |
 | `POSTGRES_MAX_IDLE_CONNS`    | `25`        | Idle ceiling. Must not exceed the open ceiling. |
 | `POSTGRES_CONN_MAX_LIFETIME` | `30m`       | Connection recycle age.                      |
+| `POSTGRES_CONNECT_TIMEOUT`   | `10s`       | Bounds the initial connection and its verifying ping. |
+
+`POSTGRES_MAX_IDLE_CONNS` has no `pgxpool` equivalent and is applied by the
+migration runner, which uses `database/sql`. See
+[DATABASE.md](DATABASE.md#connection-pooling).
+
+### Test-only
+
+| Variable           | Default       | Description                                                |
+| ------------------ | ------------- | ---------------------------------------------------------- |
+| `POSTGRES_TEST_DB` | `ledger_test` | Database used by the integration tests. Created and migrated automatically, so a test run never touches development data. |
 
 ## Redis
+
+Not connected to yet — validated only, for a later phase.
 
 | Variable         | Default          | Description                                  |
 | ---------------- | ---------------- | -------------------------------------------- |
@@ -56,6 +69,8 @@ persistence phase.
 | `REDIS_DB`       | `0`              | Logical database index.                      |
 
 ## Kafka
+
+Not connected to yet — validated only, for a later phase.
 
 | Variable            | Default            | Description                                        |
 | ------------------- | ------------------ | -------------------------------------------------- |
@@ -68,7 +83,8 @@ persistence phase.
 
 - `APP_ENV`, `LOG_LEVEL` or `LOG_FORMAT` is outside its allowed set.
 - A port is outside its valid range, or a numeric variable is not a number.
-- A duration is unparseable or not greater than zero.
+- A duration is unparseable or not greater than zero, including
+  `POSTGRES_CONNECT_TIMEOUT`.
 - `POSTGRES_SSLMODE` is not a valid libpq mode.
 - `POSTGRES_MAX_IDLE_CONNS` exceeds `POSTGRES_MAX_OPEN_CONNS`.
 - `APP_ENV=production` and `POSTGRES_SSLMODE=disable`.

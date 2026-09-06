@@ -50,13 +50,21 @@ logging, concurrency testing, chaos testing, CI/CD.
 - **Phase 0 — repository foundation: complete.**
   Module layout, configuration loading, health mechanism, graceful shutdown,
   Docker Compose infrastructure, Makefile, CI.
-- **Phase 1 and later: not started.** Do not begin the next phase without an
+- **Phase 1 — PostgreSQL persistence and the double-entry core: complete.**
+  pgx pool, migrations, accounts, transfers, ledger entries, database-enforced
+  accounting invariants, PostgreSQL-backed readiness, integration tests, CI
+  integration job.
+- **Phase 2 and later: not started.** Do not begin the next phase without an
   explicit instruction.
 
 Anything not present in the tree is deliberately out of scope for the current
-phase. Do not implement accounts, transfers, ledger entries, idempotency,
-authentication, Kafka producers, the outbox, observability exporters or chaos
-testing until the phase that owns them is requested.
+phase. Do not implement Redis idempotency, authentication, gRPC, Kafka
+producers, the outbox, observability exporters or chaos testing until the phase
+that owns them is requested.
+
+Concurrency hardening — deterministic lock ordering, serialization retry loops,
+double-spend and stress testing — belongs to Phase 2. Until that work exists
+and passes, **do not claim the system is safe under concurrent load.**
 
 ## 4. Engineering conventions
 
@@ -73,8 +81,14 @@ testing until the phase that owns them is requested.
   with `_`.
 - **Secrets.** Never log credentials. Config values that carry secrets are
   redacted through `Config.Redacted()` before logging.
-- **Money.** Amounts are integer minor units (cents). Floating point must
-  never represent money.
+- **Money.** Amounts are integer minor units (cents), stored as `BIGINT`.
+  Floating point must never represent money — not `float32`, `float64`, `REAL`
+  or `DOUBLE PRECISION`, anywhere.
+- **The ledger is append-only.** Never add an update or delete path for
+  `ledger_entries`, and never expose entry creation outside the transfer
+  posting. Corrections are reversing entries.
+- **Migrations are append-only** once applied beyond a local machine, and the
+  application never migrates at start-up.
 - **Tests.** Table-driven where practical. Concurrency-sensitive code must
   have a test that fails under `-race` if the synchronisation is removed.
 
@@ -83,19 +97,26 @@ testing until the phase that owns them is requested.
 Every change must pass, before commit:
 
 ```sh
-make ci      # fmt-check, vet, build, test, race
+make ci      # fmt-check, vet, build, test, race — no infrastructure needed
+make verify  # the above plus compose config and PostgreSQL integration tests
 ```
 
 which is equivalent to:
 
 ```sh
-gofmt -l .            # must print nothing
+gofmt -l .                        # must print nothing
 go vet ./...
+go vet -tags=integration ./...
 go build ./...
 go test ./...
 go test -race ./...
-docker compose config # must parse
+go test -tags=integration ./...   # needs PostgreSQL: make infra-up
+docker compose config             # must parse
 ```
+
+Integration tests must run against a real PostgreSQL, never a mock. They fail
+loudly when the database is missing rather than skipping — a test that silently
+skips is a test that never runs.
 
 ## 6. Reporting format
 

@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/config"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/database"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/health"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/httpapi"
 )
@@ -62,10 +63,27 @@ func run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Phase 0 has no dependencies to probe, so readiness passes as soon as the
-	// process is serving. Later phases register PostgreSQL, Redis and Kafka
-	// here.
+	// A malformed DSN is a configuration error and is fatal.
+	db, err := database.New(cfg, log)
+	if err != nil {
+		return err
+	}
+	// Closed after the HTTP server has drained, so in-flight requests keep
+	// their connections until they finish.
+	defer db.Close()
+
+	// An unreachable database is deliberately not fatal. The process starts and
+	// reports itself unready, so an orchestrator withholds traffic instead of
+	// restarting the pod in a crash loop, and the service recovers on its own
+	// once PostgreSQL comes back. The schema is applied by cmd/migrate, never
+	// from here.
+	if err := db.Verify(ctx); err != nil {
+		log.ErrorContext(ctx, "postgres is not reachable at start-up; /readyz will report unready until it recovers",
+			slog.String("error", err.Error()))
+	}
+
 	registry := health.New(health.DefaultTimeout)
+	registry.Register("postgres", db.Ping)
 
 	if err := httpapi.New(cfg, log, registry, build).Run(ctx); err != nil {
 		return fmt.Errorf("api server: %w", err)

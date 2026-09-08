@@ -44,6 +44,7 @@ import (
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/config"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/ledger"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/money"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/reconcile"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/transfer"
 )
 
@@ -188,6 +189,11 @@ type env struct {
 	accounts  *account.Repository
 	transfers *transfer.Service
 	entries   *ledger.Repository
+
+	// baseline records money placed into accounts by the test fixture rather
+	// than by a transfer, so reconciliation can account for it explicitly.
+	// See reconcile.Baseline for why this exception exists.
+	baseline reconcile.Baseline
 }
 
 // newEnv returns a clean environment: every table is emptied first, so tests
@@ -206,6 +212,7 @@ func newEnv(t *testing.T) *env {
 		accounts:  account.NewRepository(sharedPool),
 		transfers: transfer.NewService(sharedPool, log),
 		entries:   ledger.NewRepository(sharedPool),
+		baseline:  reconcile.Baseline{},
 	}
 }
 
@@ -256,6 +263,33 @@ func fund(t *testing.T, e *env, id uuid.UUID, minor int64) {
 	}
 	if tag.RowsAffected() != 1 {
 		t.Fatalf("funding account %s affected %d rows, want 1", id, tag.RowsAffected())
+	}
+
+	// Record the unexplained money so reconciliation can subtract it.
+	e.baseline[id] += minor
+}
+
+// assertReconciled runs the full reconciliation and fails the test with every
+// problem it found.
+//
+// This is the strongest assertion available: it queries committed rows
+// directly, so it holds regardless of what the Go code believed happened.
+func assertReconciled(t *testing.T, e *env) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	report, err := reconcile.Check(ctx, e.pool, e.baseline)
+	if err != nil {
+		t.Fatalf("reconciliation failed to run: %v", err)
+	}
+	if !report.OK() {
+		for _, problem := range report.Problems() {
+			t.Errorf("reconciliation: %s", problem)
+		}
+		t.Fatalf("reconciliation found %d violations across %d accounts and %d completed transfers",
+			report.Violations(), report.Accounts, report.CompletedTransfers)
 	}
 }
 

@@ -1,0 +1,115 @@
+# Large concurrency stress runs.
+#
+# MANUAL ONLY. This workflow has no schedule and no triggers other than
+# workflow_dispatch: 500- and 1000-attempt runs are too slow and too
+# contention-sensitive to belong on every pull request, and a scheduled job
+# would start publishing results nobody asked for. Ordinary correctness — the
+# deterministic concurrency suite — runs in ci.yml on every push.
+#
+# It publishes nothing. The result is printed in the job log and attached as a
+# build artifact.
+
+name: Stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      attempts:
+        description: "Total transfer attempts"
+        required: false
+        default: "1000"
+      scenario:
+        description: "oneway | opposing | ring"
+        required: false
+        default: "oneway"
+      runs:
+        description: "How many times to repeat the scenario"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: Concurrent transfer stress
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+          POSTGRES_DB: ledger_stress
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledger -d ledger_stress"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger_stress
+      POSTGRES_SSLMODE: disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Apply migrations
+        run: go run ./cmd/migrate up
+
+      # Build progressively rather than starting at the top, so a failure at
+      # low concurrency is not hidden behind a slow large run.
+      - name: Progressive stress runs
+        run: |
+          set -euo pipefail
+          mkdir -p stress-results
+
+          for n in 100 500 "${{ inputs.attempts }}"; do
+            for run in $(seq 1 "${{ inputs.runs }}"); do
+              echo "::group::${{ inputs.scenario }} — $n attempts, run $run"
+              go run ./cmd/stress \
+                -scenario "${{ inputs.scenario }}" \
+                -attempts "$n" \
+                -json | tee "stress-results/${{ inputs.scenario }}-$n-run$run.json"
+              echo "::endgroup::"
+            done
+          done
+
+      # The runner exits non-zero on any invariant violation, so reaching here
+      # already means every run was clean. This makes that explicit in the log.
+      - name: Summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "| scenario | attempts | successful | exhausted | unexpected | ser. retries | deadlocks | negative | violations | conserved |"
+          echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+          for f in stress-results/*.json; do
+            python3 - "$f" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          print("| {scenario} | {attempts} | {successful} | {exhausted_retries} | {unexpected_failures} | "
+                "{serialization_retries} | {deadlock_retries} | {negative_balances} | "
+                "{ledger_invariant_violations} | {conservation_held} |".format(**r))
+          PY
+          done
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-results
+          path: stress-results/
+          retention-days: 30

@@ -131,7 +131,17 @@ jobs:
       - name: Integration tests
         run: make test-integration
 
-      - name: Integration tests with race detector
+      # Run verbosely so the observed retry and deadlock counts land in the CI
+      # log. A deadlock count above zero means lock ordering regressed, and the
+      # test asserts it — but having the number visible makes the failure
+      # immediately legible.
+      - name: Deterministic concurrency tests
+        run: make test-concurrency
+
+      # Concurrency correctness has to hold under the race detector too. A
+      # database serialization conflict is not a Go data race; both must be
+      # clean.
+      - name: Integration and concurrency tests with race detector
         run: make test-integration-race
 
   compose:

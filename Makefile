@@ -22,6 +22,16 @@ GO_PACKAGES := ./...
 # requires a running PostgreSQL (make infra-up).
 INTEGRATION_TAG := integration
 
+# The deterministic concurrency tests. These run in CI; the large stress
+# scenarios live in cmd/stress and are run on demand.
+CONCURRENCY_TESTS := 'TestConcurrent|TestOpposing|TestLockOrder|TestMultiAccount|TestProgressive|TestBusinessRejections|TestValidationFailures|TestCancelledContext'
+
+# Stress runner defaults, overridable: make stress ATTEMPTS=500 SCENARIO=ring
+ATTEMPTS   ?= 100
+CONCURRENCY ?= 0
+SCENARIO   ?= oneway
+AMOUNT     ?= 100
+
 .DEFAULT_GOAL := help
 
 ## help: List the available targets.
@@ -103,6 +113,18 @@ test-integration:
 test-integration-race:
 	go test -tags=$(INTEGRATION_TAG) -race -count=1 $(GO_PACKAGES)
 
+## test-concurrency: Run the deterministic concurrency tests (needs make infra-up).
+.PHONY: test-concurrency
+test-concurrency:
+	go test -tags=$(INTEGRATION_TAG) -count=1 -timeout 15m -v \
+		-run $(CONCURRENCY_TESTS) ./tests/
+
+## test-concurrency-race: Concurrency tests under the race detector.
+.PHONY: test-concurrency-race
+test-concurrency-race:
+	go test -tags=$(INTEGRATION_TAG) -race -count=1 -timeout 20m -v \
+		-run $(CONCURRENCY_TESTS) ./tests/
+
 ## test-all: Run every suite, fast and integration.
 .PHONY: test-all
 test-all: test test-integration
@@ -144,6 +166,45 @@ run:
 .PHONY: clean
 clean:
 	rm -rf $(BIN_DIR) coverage.out coverage.html
+
+# ---------------------------------------------------------------------------
+# Stress and load testing
+# ---------------------------------------------------------------------------
+#
+# cmd/stress is development tooling: it drives internal/transfer directly and
+# creates and funds its own accounts. Point it at a scratch database, never at
+# anything you care about:
+#
+#   POSTGRES_DB=ledger_stress go run ./cmd/migrate up
+#   make stress-1000 POSTGRES_DB=ledger_stress
+
+## stress: Run the stress scenario (ATTEMPTS, CONCURRENCY, SCENARIO, AMOUNT).
+.PHONY: stress
+stress:
+	go run ./cmd/stress \
+		-scenario $(SCENARIO) -attempts $(ATTEMPTS) \
+		-concurrency $(CONCURRENCY) -amount $(AMOUNT)
+
+## stress-1000: Run 1000 simultaneous transfers against one account.
+.PHONY: stress-1000
+stress-1000:
+	go run ./cmd/stress -scenario oneway -attempts 1000 -concurrency 1000
+
+## stress-json: Run the stress scenario and emit JSON on stdout.
+.PHONY: stress-json
+stress-json:
+	@go run ./cmd/stress \
+		-scenario $(SCENARIO) -attempts $(ATTEMPTS) \
+		-concurrency $(CONCURRENCY) -amount $(AMOUNT) -json
+
+## stress-suite: Run the progressive scenarios used for docs/results.
+.PHONY: stress-suite
+stress-suite:
+	@for n in 10 25 50 100 500 1000; do \
+		echo "=== $$n attempts ==="; \
+		go run ./cmd/stress -scenario oneway -attempts $$n || exit 1; \
+		echo; \
+	done
 
 # ---------------------------------------------------------------------------
 # Database migrations
@@ -241,6 +302,6 @@ ci: fmt-check vet build test test-race
 
 ## verify: Full verification: the CI gate, Compose validation and integration tests.
 .PHONY: verify
-verify: ci compose-config test-integration
+verify: ci compose-config test-integration test-integration-race
 	@echo "Full verification passed."
 

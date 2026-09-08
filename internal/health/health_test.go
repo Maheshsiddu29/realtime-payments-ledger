@@ -198,3 +198,92 @@ func TestRegistryConcurrentAccess(t *testing.T) {
 		t.Errorf("Status = %q, want %q", report.Status, StatusHealthy)
 	}
 }
+
+// An optional dependency that fails must be reported without making the
+// process unready. Withdrawing traffic from every replica over a dependency
+// the process can serve without turns a partial outage into a total one.
+func TestOptionalCheckDegradesWithoutFailingReadiness(t *testing.T) {
+	t.Parallel()
+
+	r := New(time.Second)
+	r.Register("postgres", func(context.Context) error { return nil })
+	r.RegisterOptional("redis", func(context.Context) error { return errors.New("connection refused") })
+
+	report := r.Check(context.Background())
+
+	if !report.Healthy() {
+		t.Errorf("Status = %q, want %q: an optional failure must not make the process unready",
+			report.Status, StatusHealthy)
+	}
+	if !report.Degraded {
+		t.Error("Degraded = false, want true when an optional check fails")
+	}
+	if got, want := strings.Join(report.Failed(), ","), "redis"; got != want {
+		t.Errorf("Failed() = %q, want %q", got, want)
+	}
+	if got := report.FailedRequired(); len(got) != 0 {
+		t.Errorf("FailedRequired() = %v, want none", got)
+	}
+	if report.Checks["redis"].Required {
+		t.Error("the redis check reports itself required")
+	}
+	if !report.Checks["postgres"].Required {
+		t.Error("the postgres check reports itself optional")
+	}
+}
+
+// A required dependency still makes the process unready.
+func TestRequiredCheckFailsReadiness(t *testing.T) {
+	t.Parallel()
+
+	r := New(time.Second)
+	r.Register("postgres", func(context.Context) error { return errors.New("down") })
+	r.RegisterOptional("redis", func(context.Context) error { return nil })
+
+	report := r.Check(context.Background())
+
+	if report.Healthy() {
+		t.Errorf("Status = %q, want %q", report.Status, StatusUnhealthy)
+	}
+	if report.Degraded {
+		t.Error("Degraded = true, but only a required check failed")
+	}
+	if got, want := strings.Join(report.FailedRequired(), ","), "postgres"; got != want {
+		t.Errorf("FailedRequired() = %q, want %q", got, want)
+	}
+}
+
+// Re-registering a name must also update whether it is required, so start-up
+// wiring stays idempotent.
+func TestRegisterReplacesRequirednessToo(t *testing.T) {
+	t.Parallel()
+
+	r := New(time.Second)
+	r.Register("redis", func(context.Context) error { return errors.New("down") })
+	r.RegisterOptional("redis", func(context.Context) error { return errors.New("down") })
+
+	if got := r.Len(); got != 1 {
+		t.Fatalf("Len() = %d, want 1", got)
+	}
+	report := r.Check(context.Background())
+	if !report.Healthy() {
+		t.Errorf("Status = %q, want %q after re-registering as optional", report.Status, StatusHealthy)
+	}
+	if !report.Degraded {
+		t.Error("Degraded = false, want true")
+	}
+}
+
+// A clean run must not look degraded.
+func TestHealthyReportIsNotDegraded(t *testing.T) {
+	t.Parallel()
+
+	r := New(time.Second)
+	r.Register("postgres", func(context.Context) error { return nil })
+	r.RegisterOptional("redis", func(context.Context) error { return nil })
+
+	report := r.Check(context.Background())
+	if !report.Healthy() || report.Degraded {
+		t.Errorf("Status = %q, Degraded = %v, want healthy and not degraded", report.Status, report.Degraded)
+	}
+}

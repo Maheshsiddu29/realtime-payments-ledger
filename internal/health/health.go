@@ -30,8 +30,11 @@ type CheckFunc func(ctx context.Context) error
 
 // Result is the outcome of one named check.
 type Result struct {
-	Status   Status        `json:"status"`
-	Error    string        `json:"error,omitempty"`
+	Status Status `json:"status"`
+	Error  string `json:"error,omitempty"`
+	// Required reports whether a failure of this check makes the process
+	// unready, as opposed to merely degraded.
+	Required bool          `json:"required"`
 	Duration time.Duration `json:"-"`
 	// LatencyMS is the serialised form of Duration; milliseconds are the unit
 	// operators read in dashboards.
@@ -40,15 +43,19 @@ type Result struct {
 
 // Report aggregates the results of every registered check.
 type Report struct {
-	Status Status            `json:"status"`
-	Checks map[string]Result `json:"checks"`
+	Status Status `json:"status"`
+	// Degraded is true when an optional dependency is failing. The process is
+	// still ready — it can serve — but it is not running at full capability,
+	// which an operator needs to see without traffic being withdrawn.
+	Degraded bool              `json:"degraded"`
+	Checks   map[string]Result `json:"checks"`
 }
 
 // Healthy reports whether the aggregate status is healthy.
 func (r Report) Healthy() bool { return r.Status == StatusHealthy }
 
-// Failed returns the names of the checks that failed, sorted for stable
-// logging and test assertions.
+// Failed returns the names of the checks that failed, required or not, sorted
+// for stable logging and test assertions.
 func (r Report) Failed() []string {
 	var names []string
 	for name, res := range r.Checks {
@@ -60,9 +67,26 @@ func (r Report) Failed() []string {
 	return names
 }
 
+// FailedRequired returns the names of the failed checks that make the process
+// unready.
+func (r Report) FailedRequired() []string {
+	var names []string
+	for name, res := range r.Checks {
+		if res.Status != StatusHealthy && res.Required {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 type check struct {
 	name string
 	fn   CheckFunc
+	// required is false for dependencies the process can serve without. An
+	// optional check that fails is reported, and marks the report degraded,
+	// but does not make the process unready.
+	required bool
 }
 
 // Registry holds the set of dependency checks for the process. The zero value
@@ -89,9 +113,24 @@ func New(timeout time.Duration) *Registry {
 	return &Registry{timeout: timeout}
 }
 
-// Register adds a check under name. Registering the same name twice replaces
-// the previous check, which keeps start-up wiring idempotent.
+// Register adds a required check under name. A required check that fails makes
+// the process unready. Registering the same name twice replaces the previous
+// check, which keeps start-up wiring idempotent.
 func (r *Registry) Register(name string, fn CheckFunc) {
+	r.register(name, fn, true)
+}
+
+// RegisterOptional adds a check whose failure is reported and marks the report
+// degraded, but does not make the process unready.
+//
+// It is for a dependency the process can serve without. Withdrawing traffic
+// from every replica because such a dependency is down converts a partial
+// outage into a total one.
+func (r *Registry) RegisterOptional(name string, fn CheckFunc) {
+	r.register(name, fn, false)
+}
+
+func (r *Registry) register(name string, fn CheckFunc, required bool) {
 	if fn == nil {
 		panic("health: Register called with a nil CheckFunc for " + name)
 	}
@@ -102,10 +141,11 @@ func (r *Registry) Register(name string, fn CheckFunc) {
 	for i := range r.checks {
 		if r.checks[i].name == name {
 			r.checks[i].fn = fn
+			r.checks[i].required = required
 			return
 		}
 	}
-	r.checks = append(r.checks, check{name: name, fn: fn})
+	r.checks = append(r.checks, check{name: name, fn: fn, required: required})
 }
 
 // Names returns the registered check names in registration order.
@@ -162,6 +202,7 @@ func (r *Registry) Check(ctx context.Context) Report {
 
 			res := Result{
 				Status:    StatusHealthy,
+				Required:  c.required,
 				Duration:  elapsed,
 				LatencyMS: elapsed.Milliseconds(),
 			}
@@ -179,9 +220,13 @@ func (r *Registry) Check(ctx context.Context) Report {
 
 	report.Checks = results
 	for _, res := range results {
-		if res.Status != StatusHealthy {
+		if res.Status == StatusHealthy {
+			continue
+		}
+		if res.Required {
 			report.Status = StatusUnhealthy
-			break
+		} else {
+			report.Degraded = true
 		}
 	}
 	return report

@@ -41,6 +41,12 @@ func TestLoadDefaults(t *testing.T) {
 	if got, want := cfg.Postgres.ConnectTimeout, 10*time.Second; got != want {
 		t.Errorf("Postgres.ConnectTimeout = %s, want %s", got, want)
 	}
+	if got, want := cfg.Idempotency.TTL, 24*time.Hour; got != want {
+		t.Errorf("Idempotency.TTL = %s, want %s", got, want)
+	}
+	if got, want := cfg.Idempotency.ProcessingTTL, 30*time.Second; got != want {
+		t.Errorf("Idempotency.ProcessingTTL = %s, want %s", got, want)
+	}
 	if got, want := len(cfg.Kafka.Brokers), 1; got != want {
 		t.Fatalf("len(Kafka.Brokers) = %d, want %d", got, want)
 	}
@@ -166,6 +172,24 @@ func TestLoadValidationErrors(t *testing.T) {
 			name:    "negative redis database",
 			env:     map[string]string{"REDIS_DB": "-1"},
 			wantMsg: "REDIS_DB",
+		},
+		{
+			name:    "non-positive redis command timeout",
+			env:     map[string]string{"REDIS_COMMAND_TIMEOUT": "0s"},
+			wantMsg: "REDIS_COMMAND_TIMEOUT",
+		},
+		{
+			name:    "non-positive idempotency ttl",
+			env:     map[string]string{"IDEMPOTENCY_TTL": "0s"},
+			wantMsg: "IDEMPOTENCY_TTL",
+		},
+		{
+			name: "processing lease outliving the cached result",
+			env: map[string]string{
+				"IDEMPOTENCY_TTL":            "10s",
+				"IDEMPOTENCY_PROCESSING_TTL": "60s",
+			},
+			wantMsg: "must not exceed IDEMPOTENCY_TTL",
 		},
 		{
 			name:    "empty audit topic",

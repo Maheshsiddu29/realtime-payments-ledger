@@ -35,11 +35,12 @@ const redacted = "[REDACTED]"
 
 // Config is the fully validated configuration for the API process.
 type Config struct {
-	App      App
-	HTTP     HTTP
-	Postgres Postgres
-	Redis    Redis
-	Kafka    Kafka
+	App         App
+	HTTP        HTTP
+	Postgres    Postgres
+	Redis       Redis
+	Kafka       Kafka
+	Idempotency Idempotency
 }
 
 // App holds process-level identity and logging settings.
@@ -99,11 +100,32 @@ func (p Postgres) dsn(password string) string {
 	)
 }
 
-// Redis holds connection settings for the cache/idempotency store.
+// Redis holds connection settings for the idempotency coordination store.
 type Redis struct {
 	Addr     string
 	Password string
 	DB       int
+	// DialTimeout bounds establishing a connection.
+	DialTimeout time.Duration
+	// CommandTimeout bounds a single command. Redis sits in the request path,
+	// so a wedged server must fail fast rather than stall a payment.
+	CommandTimeout time.Duration
+}
+
+// Idempotency holds the lifetimes of idempotency records.
+//
+// These are Redis-side lifetimes only. Expiry never weakens deduplication:
+// the UNIQUE constraint on transfers.idempotency_key is the final barrier and
+// has no TTL. See docs/IDEMPOTENCY.md.
+type Idempotency struct {
+	// TTL is how long a completed result stays cached in Redis. It bounds how
+	// long a replay can be served without touching PostgreSQL, not how long
+	// deduplication lasts.
+	TTL time.Duration
+	// ProcessingTTL is the lease on an in-flight claim. If the process holding
+	// it dies, the claim expires after this long and another request may take
+	// over; PostgreSQL uniqueness still prevents a second transfer.
+	ProcessingTTL time.Duration
 }
 
 // Kafka holds connection settings for the audit event stream.
@@ -182,9 +204,15 @@ func load(lookup lookupFunc) (Config, error) {
 			ConnectTimeout:  e.duration("POSTGRES_CONNECT_TIMEOUT", 10*time.Second),
 		},
 		Redis: Redis{
-			Addr:     e.str("REDIS_ADDR", "localhost:6379"),
-			Password: e.str("REDIS_PASSWORD", ""),
-			DB:       e.intVal("REDIS_DB", 0),
+			Addr:           e.str("REDIS_ADDR", "localhost:6379"),
+			Password:       e.str("REDIS_PASSWORD", ""),
+			DB:             e.intVal("REDIS_DB", 0),
+			DialTimeout:    e.duration("REDIS_DIAL_TIMEOUT", 3*time.Second),
+			CommandTimeout: e.duration("REDIS_COMMAND_TIMEOUT", time.Second),
+		},
+		Idempotency: Idempotency{
+			TTL:           e.duration("IDEMPOTENCY_TTL", 24*time.Hour),
+			ProcessingTTL: e.duration("IDEMPOTENCY_PROCESSING_TTL", 30*time.Second),
 		},
 		Kafka: Kafka{
 			Brokers:    e.list("KAFKA_BROKERS", []string{"localhost:29092"}),
@@ -281,6 +309,25 @@ func (c Config) validate() []error {
 	}
 	if c.Redis.DB < 0 {
 		fail("REDIS_DB %d must not be negative", c.Redis.DB)
+	}
+	if c.Redis.DialTimeout <= 0 {
+		fail("REDIS_DIAL_TIMEOUT must be greater than zero, got %s", c.Redis.DialTimeout)
+	}
+	if c.Redis.CommandTimeout <= 0 {
+		fail("REDIS_COMMAND_TIMEOUT must be greater than zero, got %s", c.Redis.CommandTimeout)
+	}
+
+	if c.Idempotency.TTL <= 0 {
+		fail("IDEMPOTENCY_TTL must be greater than zero, got %s", c.Idempotency.TTL)
+	}
+	if c.Idempotency.ProcessingTTL <= 0 {
+		fail("IDEMPOTENCY_PROCESSING_TTL must be greater than zero, got %s", c.Idempotency.ProcessingTTL)
+	}
+	// A processing lease that outlives the cached result would leave a key
+	// blocking payments after the result it guards has already expired.
+	if c.Idempotency.ProcessingTTL > c.Idempotency.TTL {
+		fail("IDEMPOTENCY_PROCESSING_TTL %s must not exceed IDEMPOTENCY_TTL %s",
+			c.Idempotency.ProcessingTTL, c.Idempotency.TTL)
 	}
 
 	if len(c.Kafka.Brokers) == 0 {

@@ -192,9 +192,11 @@ Compose PostgreSQL is *also* configured with
 session behave like the application; the CI service container is left at the
 default, and the application is unaffected either way.
 
-**Phase 1 does not retry serialization failures and does no row locking.** See
-[LEDGER_DESIGN.md](LEDGER_DESIGN.md#transaction-isolation-honestly) for the
-full statement of what is and is not guaranteed under concurrency.
+Since Phase 2 the posting transaction also locks both account rows with
+`SELECT ... FOR UPDATE`, in canonical UUID order, and retries serialization
+failures (`40001`) and deadlocks (`40P01`) under a bounded policy. See
+[CONCURRENCY.md](CONCURRENCY.md) for the locking strategy, the retry policy and
+the measured behaviour under load.
 
 ## Connection pooling
 

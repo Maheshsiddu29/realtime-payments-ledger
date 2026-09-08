@@ -5,10 +5,11 @@ PostgreSQL with serializable transactions, Redis-backed idempotency, a gRPC
 API, a transactional outbox feeding Kafka audit events, and distributed
 tracing.
 
-> **Status: Phase 1 — PostgreSQL persistence and the double-entry core.**
+> **Status: Phase 2 — concurrency safety.**
 > Accounts, transfers and ledger entries exist and are enforced by the
-> database. Redis, Kafka, gRPC, authentication and tracing are **not
-> implemented** — see [docs/roadmap.md](docs/roadmap.md).
+> database, and transfer posting is hardened against concurrent execution.
+> Redis, Kafka, gRPC, authentication and tracing are **not implemented** —
+> see [docs/roadmap.md](docs/roadmap.md).
 
 ## What works today
 
@@ -20,12 +21,24 @@ tracing.
 - Versioned up/down migrations, applied by an operator, never at boot
 - PostgreSQL-backed readiness, separate from liveness
 - Graceful shutdown that drains in-flight requests before closing the pool
+- Both account rows locked with `SELECT ... FOR UPDATE` in **canonical UUID
+  order**, so opposing `A → B` and `B → A` transfers cannot deadlock
+- Bounded retry of serialization failures (`40001`) and deadlocks (`40P01`),
+  classified by SQLSTATE; business rejections are never retried
+- Reconciliation of stored balances against the ledger
+- A concurrent load generator with machine-readable results
 
 Not implemented: Redis idempotency, Kafka, the outbox, gRPC, OAuth2/JWT,
-OpenTelemetry, Jaeger, Loki, Toxiproxy. Concurrency hardening (lock ordering,
-serialization retry, stress testing) is Phase 2 — see
-[the isolation section](docs/LEDGER_DESIGN.md#transaction-isolation-honestly)
-for exactly what is and is not guaranteed today.
+OpenTelemetry, Jaeger, Loki, Toxiproxy.
+
+**Measured, not claimed:** across three separate 1,000-attempt runs plus
+opposing-direction and four-account variants, these runs recorded zero double
+spends, zero negative balances, zero unbalanced ledgers and zero deadlocks,
+with money conserved exactly. That is evidence from executed tests, not a
+proof of impossibility — see
+[docs/results/concurrency-1000.md](docs/results/concurrency-1000.md) for the
+numbers and
+[docs/CONCURRENCY.md](docs/CONCURRENCY.md#limitations) for the limits.
 
 ## Quick start
 
@@ -109,14 +122,32 @@ Full explanation: [docs/LEDGER_DESIGN.md](docs/LEDGER_DESIGN.md).
 ## Development
 
 ```sh
-make help                # list every target
-make ci                  # fast gate: fmt-check, vet, build, test, test-race
-make test                # fast suites only, no infrastructure needed
-make test-integration    # PostgreSQL integration tests (needs make infra-up)
-make verify              # everything: ci + compose config + integration tests
-make cover-html          # coverage report at coverage.html
-make binary              # build bin/api with version metadata
+make help                  # list every target
+make ci                    # fast gate: fmt-check, vet, build, test, test-race
+make test                  # fast suites only, no infrastructure needed
+make test-integration      # PostgreSQL integration tests (needs make infra-up)
+make test-concurrency      # deterministic concurrency tests, verbose
+make test-concurrency-race # the same under the race detector
+make verify                # everything: ci + compose config + integration + race
+make cover-html            # coverage report at coverage.html
+make binary                # build bin/api with version metadata
 ```
+
+### Stress testing
+
+`cmd/stress` is development tooling. It drives `internal/transfer` in-process
+(there is no transfer API yet) and creates and funds its own accounts, so point
+it at a scratch database:
+
+```sh
+POSTGRES_DB=ledger_stress go run ./cmd/migrate up
+make stress ATTEMPTS=100 POSTGRES_DB=ledger_stress
+make stress-1000 POSTGRES_DB=ledger_stress
+make stress-json ATTEMPTS=500 SCENARIO=opposing POSTGRES_DB=ledger_stress
+```
+
+Scenarios are `oneway`, `opposing` and `ring`, all deterministic. The runner
+exits non-zero if any invariant was violated.
 
 ### Test layout
 
@@ -153,18 +184,21 @@ Full reference: [docs/configuration.md](docs/configuration.md). Local defaults:
 ```
 cmd/api/            Process entrypoint: wiring and signal handling only
 cmd/migrate/        Schema migration runner (operator-run, never at boot)
+cmd/stress/         Concurrent load generator (development tooling)
 internal/config/    Environment parsing, defaulting and validation
 internal/database/  pgx pool: construction, verification, readiness, shutdown
 internal/money/     Currency type and minor-unit representation rules
 internal/account/   Account records and persistence
-internal/transfer/  Atomic double-entry posting
+internal/transfer/  Atomic double-entry posting, row locking, retry policy
 internal/ledger/    Read-only ledger entry access
+internal/reconcile/ Balance and ledger reconciliation checks
 internal/health/    Concurrency-safe dependency check registry
 internal/httpapi/   Operational HTTP endpoints and server lifecycle
 migrations/         Versioned up/down SQL migrations
-tests/              End-to-end and PostgreSQL integration tests
+tests/              End-to-end, integration and concurrency tests
 docs/               Architecture, ledger design, database and configuration
-.github/workflows/  CI: lint, test, race, integration, Compose, image
+.github/workflows/  CI: lint, test, race, integration, concurrency, Compose,
+                    image; plus a manual-only stress workflow
 ```
 
 Documentation:
@@ -172,6 +206,8 @@ Documentation:
 | Document                                       | Contents                                            |
 | ---------------------------------------------- | --------------------------------------------------- |
 | [docs/LEDGER_DESIGN.md](docs/LEDGER_DESIGN.md) | Double-entry accounting, money representation, invariants and exactly what enforces each one |
+| [docs/CONCURRENCY.md](docs/CONCURRENCY.md)     | Locking, retries, deadlock prevention, reconciliation and limitations |
+| [docs/results/](docs/results/)                 | Measured stress results, with the environment they came from |
 | [docs/DATABASE.md](docs/DATABASE.md)           | Tables, constraints, indexes, triggers, migrations, transaction boundaries |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)   | Package layout and design decisions                 |
 | [docs/configuration.md](docs/configuration.md) | Every environment variable                          |
@@ -196,7 +232,7 @@ Loki · Toxiproxy · Docker Compose · GitHub Actions
 
 Implemented so far: Go, PostgreSQL, Docker Compose, GitHub Actions. Three
 direct Go dependencies — `pgx/v5`, `google/uuid` and `golang-migrate` — with
-the standard library covering logging, HTTP and error handling.
+the standard library covering logging, HTTP, randomness and error handling.
 
 ## Repository rules
 

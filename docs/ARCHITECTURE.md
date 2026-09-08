@@ -59,15 +59,17 @@ environment.
 | ------------------- | --------------------------------------------------------------------- |
 | `cmd/api`           | Entrypoint. Wiring and signal handling only; no business logic.        |
 | `cmd/migrate`       | Applies and reverses schema migrations. Run by an operator, not at boot.|
+| `cmd/stress`        | Development tooling: concurrent load generator. Never deployed.         |
 | `internal/config`   | Environment parsing, defaulting and validation. The only reader of env.|
 | `internal/database` | Owns the pgx pool: construction, verification, readiness, shutdown.    |
 | `internal/money`    | Currency type and validation. Minor-unit representation rules.         |
 | `internal/account`  | Account records and their persistence.                                 |
-| `internal/transfer` | The atomic double-entry posting operation.                             |
+| `internal/transfer` | Atomic double-entry posting, row locking and the retry policy.         |
 | `internal/ledger`   | Read-only access to ledger entries.                                    |
+| `internal/reconcile`| Verifies stored balances and ledger entries against each other.        |
 | `internal/health`   | Concurrency-safe registry of named dependency checks.                  |
 | `internal/httpapi`  | Operational HTTP surface and server lifecycle.                         |
-| `tests`             | End-to-end and PostgreSQL integration tests.                           |
+| `tests`             | End-to-end, integration and concurrency tests.                         |
 
 Everything sits under `internal/`, so no package can be imported by an outside
 module. The public contract of this system is its API, not its Go types.
@@ -129,8 +131,15 @@ and the completion update. Either all of it is durable or none of it is.
 PostgreSQL enforces the double-entry invariant itself, using deferred
 constraint triggers that run at `COMMIT`. That enforcement is not an
 application convention — it applies to `psql` sessions and future services
-equally. See [LEDGER_DESIGN.md](LEDGER_DESIGN.md) for what is guaranteed, and
-what is explicitly not guaranteed under concurrency.
+equally. See [LEDGER_DESIGN.md](LEDGER_DESIGN.md).
+
+Both account rows are locked with `SELECT ... FOR UPDATE` before any balance
+changes, in **canonical UUID order** rather than transfer direction, so that
+`A → B` and `B → A` request the same rows in the same sequence and cannot
+deadlock. Lock acquisition order and business roles are kept strictly separate:
+the debit always lands on the source, whichever row was locked first.
+Serialization failures are retried under a bounded policy outside the
+transaction. See [CONCURRENCY.md](CONCURRENCY.md).
 
 ### The ledger package cannot write
 
@@ -185,6 +194,9 @@ name fails loudly instead of creating a phantom stream.
 
 Redis idempotency, OAuth2/JWT authentication, the gRPC server, the
 transactional outbox, the Kafka producer, OpenTelemetry tracing, and chaos
-testing. Concurrency hardening — deterministic lock ordering, serialization
-retry, double-spend and stress testing — is Phase 2. Each belongs to a later
-phase; see [roadmap.md](roadmap.md).
+testing. Each belongs to a later phase; see [roadmap.md](roadmap.md).
+
+Retry counts are returned in-process through `transfer.Attempts` and consumed
+by tests and the load generator. No metrics are exported: Prometheus and
+OpenTelemetry belong to the observability phase and were deliberately not added
+here just to count retries.

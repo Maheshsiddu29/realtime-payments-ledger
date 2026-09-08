@@ -29,15 +29,24 @@ Database connectivity and the accounting schema.
 Explicitly **not** done in this phase: concurrency hardening. See
 [LEDGER_DESIGN.md](LEDGER_DESIGN.md#transaction-isolation-honestly).
 
-## Phase 2 — Transfers under concurrency
+## Phase 2 — Transfers under concurrency ✅ complete
 
-- Deterministic account lock ordering (`SELECT ... FOR UPDATE` in a fixed
-  order) so concurrent transfers over the same pair cannot deadlock.
-- A bounded retry loop on serialization failure (SQLSTATE `40001`), which
-  Phase 1 surfaces to the caller as an error.
-- Concurrency tests: parallel transfers over the same accounts must never
-  produce a negative balance, a lost update or a double spend.
-- Load testing to characterise throughput and retry rates under contention.
+- Deterministic account lock ordering: both rows locked with
+  `SELECT ... FOR UPDATE` in canonical UUID order, so opposing transfers
+  cannot deadlock. Lock order is kept separate from source/destination roles.
+- Bounded retry on SQLSTATE `40001` and `40P01`, classified through
+  `pgconn.PgError`, with full-jitter backoff and context cancellation.
+- `internal/reconcile`: stored balances checked against the ledger, plus
+  per-transfer entry verification and negative-balance detection.
+- Concurrency, deadlock-regression and double-spend integration tests, all
+  barrier-synchronised and timeout-bounded.
+- `cmd/stress`: a deterministic load generator emitting JSON results.
+- Measured results in [results/concurrency-1000.md](results/concurrency-1000.md).
+
+Design and limitations: [CONCURRENCY.md](CONCURRENCY.md).
+
+Not done in this phase: per-account admission control, which the measurements
+show is the real fix for a hot account.
 
 ## Phase 3 — Idempotency
 

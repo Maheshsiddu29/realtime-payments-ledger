@@ -314,21 +314,37 @@ At this level PostgreSQL guarantees that concurrent transactions produce a
 result equivalent to running them one after another. When it cannot guarantee
 that, it aborts one of them with a serialization failure (SQLSTATE `40001`).
 
-**What this phase does not do, and does not claim:**
+Since Phase 2 the posting also takes an explicit row lock on both accounts
+(`SELECT ... FOR UPDATE`), acquired in **canonical UUID order** so that
+opposing transfers cannot deadlock, and serialization failures are retried
+under a bounded policy. The full design, the measured results and the
+limitations are in [CONCURRENCY.md](CONCURRENCY.md).
 
-- There is **no retry loop**. A serialization failure is returned to the caller
-  as an error. Under contention a caller will see failures that a retry would
-  have resolved.
-- There is **no explicit row locking**. The posting reads accounts without
-  `SELECT ... FOR UPDATE`, relying on `SERIALIZABLE` plus the guarded `UPDATE`.
-- There is **no deterministic lock ordering**, so nothing here prevents
-  deadlocks between transfers touching the same pair of accounts in opposite
-  directions.
-- **No concurrency testing has been performed.** The correctness demonstrated
-  by this phase's tests is single-threaded correctness. No claim is made about
-  behaviour under concurrent load, and specifically **no claim is made about
-  1,000 concurrent transfer attempts.**
+### What is verified, and what is not
 
-Deterministic lock ordering, a bounded retry loop on `40001`, double-spend
-tests and concurrency stress testing are Phase 2. Until those exist and pass,
-treat this system as correct for sequential use and unproven under concurrency.
+Verified by executed tests, recorded in
+[results/concurrency-1000.md](results/concurrency-1000.md):
+
+- Observed **zero double spends** across 1,000 concurrent transfer attempts,
+  repeated three times, plus opposing-direction and four-account variants.
+- Observed zero negative balances, zero unbalanced transfers and zero
+  reconciliation discrepancies in every executed run.
+- Observed zero deadlocks with canonical lock ordering — and a reproducible
+  deadlock count without it, which is how the regression test earns its place.
+- Money conserved exactly in every run.
+
+Not claimed:
+
+- **Not proven impossible.** Those runs are evidence that these workloads on
+  this machine behaved correctly. They are not a proof that no workload can
+  ever double-spend.
+- **No throughput or latency claim.** The durations recorded were measured on
+  one laptop with PostgreSQL in Docker. They characterise that setup and
+  nothing else.
+- **1,000 simultaneous transfers against a single account is not a usable
+  operating point.** Roughly a third are refused with exhausted retries. It is
+  a stress boundary, and the results record where it lies. Bounding
+  per-account concurrency is future work.
+
+An exhausted retry is a **refusal, not corruption**: nothing was written, and
+the ledger is exactly as correct as if the request had never arrived.

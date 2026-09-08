@@ -54,17 +54,17 @@ logging, concurrency testing, chaos testing, CI/CD.
   pgx pool, migrations, accounts, transfers, ledger entries, database-enforced
   accounting invariants, PostgreSQL-backed readiness, integration tests, CI
   integration job.
-- **Phase 2 and later: not started.** Do not begin the next phase without an
+- **Phase 2 — concurrency safety: complete.**
+  Deterministic UUID-ordered row locking, bounded retry on SQLSTATE 40001 and
+  40P01, reconciliation checks, concurrency and deadlock regression tests, a
+  stress runner, and measured results in `docs/results/`.
+- **Phase 3 and later: not started.** Do not begin the next phase without an
   explicit instruction.
 
 Anything not present in the tree is deliberately out of scope for the current
 phase. Do not implement Redis idempotency, authentication, gRPC, Kafka
 producers, the outbox, observability exporters or chaos testing until the phase
 that owns them is requested.
-
-Concurrency hardening — deterministic lock ordering, serialization retry loops,
-double-spend and stress testing — belongs to Phase 2. Until that work exists
-and passes, **do not claim the system is safe under concurrent load.**
 
 ## 4. Engineering conventions
 
@@ -91,6 +91,17 @@ and passes, **do not claim the system is safe under concurrent load.**
   application never migrates at start-up.
 - **Tests.** Table-driven where practical. Concurrency-sensitive code must
   have a test that fails under `-race` if the synchronisation is removed.
+- **Locking.** Multiple account rows are always locked in canonical UUID
+  order, never in transfer direction. Lock acquisition order and business
+  roles are separate concerns: the debit lands on the source regardless of
+  which row was locked first.
+- **Retries.** Only SQLSTATE 40001 and 40P01 are retried, classified through
+  `pgconn.PgError` and never by matching error text. Business rejections must
+  never be retried. Every retry loop is bounded and honours context
+  cancellation.
+- **Claims.** An executed test supports "observed X in this run", never "X is
+  impossible". Record the machine, database version and command alongside any
+  measurement, and keep results in `docs/results/`.
 
 ## 5. Validation gate
 
@@ -104,15 +115,20 @@ make verify  # the above plus compose config and PostgreSQL integration tests
 which is equivalent to:
 
 ```sh
-gofmt -l .                        # must print nothing
+gofmt -s -l .                          # must print nothing
 go vet ./...
 go vet -tags=integration ./...
 go build ./...
 go test ./...
 go test -race ./...
-go test -tags=integration ./...   # needs PostgreSQL: make infra-up
-docker compose config             # must parse
+go test -tags=integration ./...        # needs PostgreSQL: make infra-up
+go test -race -tags=integration ./...
+docker compose config                  # must parse
 ```
+
+Concurrency changes additionally require `make test-concurrency-race` and, for
+anything touching locking or retries, a stress run recorded in
+`docs/results/`.
 
 Integration tests must run against a real PostgreSQL, never a mock. They fail
 loudly when the database is missing rather than skipping — a test that silently

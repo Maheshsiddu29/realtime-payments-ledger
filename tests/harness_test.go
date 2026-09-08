@@ -27,12 +27,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"database/sql"
 	"github.com/golang-migrate/migrate/v4"
@@ -42,6 +44,7 @@ import (
 
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/account"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/config"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/idempotency"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/ledger"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/money"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/reconcile"
@@ -59,6 +62,15 @@ const USD = money.Currency("USD")
 // TestMain against a database whose schema has already been migrated.
 var sharedPool *pgxpool.Pool
 
+// sharedRedis is the Redis client every integration test uses. It points at a
+// dedicated logical database (REDIS_TEST_DB, default 15) that the harness
+// flushes between tests, so a test run can never disturb development data.
+var sharedRedis *redis.Client
+
+// sharedConfig is the configuration the harness resolved, reused by tests that
+// need to build their own components.
+var sharedConfig config.Config
+
 // testConfig returns the application configuration with the database name
 // redirected to the dedicated test database.
 func testConfig() (config.Config, error) {
@@ -73,7 +85,20 @@ func testConfig() (config.Config, error) {
 	}
 	cfg.Postgres.Database = name
 
+	// A dedicated Redis logical database, for the same reason.
+	cfg.Redis.DB = testRedisDB()
+
 	return cfg, nil
+}
+
+// testRedisDB returns the logical Redis database integration tests may flush.
+func testRedisDB() int {
+	if raw := os.Getenv("REDIS_TEST_DB"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			return n
+		}
+	}
+	return 15
 }
 
 func TestMain(m *testing.M) {
@@ -115,6 +140,22 @@ func runTests(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("ping %s: %w", cfg.Postgres.RedactedDSN(), err)
 	}
 	sharedPool = pool
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         cfg.Redis.Addr,
+		Password:     cfg.Redis.Password,
+		DB:           cfg.Redis.DB,
+		DialTimeout:  cfg.Redis.DialTimeout,
+		ReadTimeout:  cfg.Redis.CommandTimeout,
+		WriteTimeout: cfg.Redis.CommandTimeout,
+	})
+	defer rdb.Close()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		return 0, fmt.Errorf("ping redis at %s (db %d): %w", cfg.Redis.Addr, cfg.Redis.DB, err)
+	}
+	sharedRedis = rdb
+	sharedConfig = cfg
 
 	return m.Run(), nil
 }
@@ -190,6 +231,10 @@ type env struct {
 	transfers *transfer.Service
 	entries   *ledger.Repository
 
+	// redis and store back the idempotency coordination path.
+	redis *redis.Client
+	store *idempotency.Store
+
 	// baseline records money placed into accounts by the test fixture rather
 	// than by a transfer, so reconciliation can account for it explicitly.
 	// See reconcile.Baseline for why this exception exists.
@@ -206,13 +251,32 @@ func newEnv(t *testing.T) *env {
 
 	truncateAll(t)
 
+	flushRedis(t)
+
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	store := idempotency.NewStore(sharedRedis, sharedConfig)
+
 	return &env{
 		pool:      sharedPool,
 		accounts:  account.NewRepository(sharedPool),
-		transfers: transfer.NewService(sharedPool, log),
+		transfers: transfer.NewService(sharedPool, log).WithIdempotency(store),
 		entries:   ledger.NewRepository(sharedPool),
+		redis:     sharedRedis,
+		store:     store,
 		baseline:  reconcile.Baseline{},
+	}
+}
+
+// flushRedis empties the dedicated test database so idempotency records cannot
+// leak between tests.
+func flushRedis(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := sharedRedis.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("flushing the redis test database: %v", err)
 	}
 }
 

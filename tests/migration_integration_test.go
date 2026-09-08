@@ -5,6 +5,9 @@ package tests
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,10 +65,14 @@ func TestMigrationsRoundTrip(t *testing.T) {
 
 	assertVersion("after initial down", 0)
 
+	// Derived from the directory rather than hard-coded, so adding a migration
+	// does not require editing this test.
+	latest := latestMigrationVersion(t)
+
 	if err := m.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	assertVersion("after up", 4)
+	assertVersion("after up", latest)
 	assertTables(t, ctx, cfg.Postgres.DSN(), true)
 
 	if err := m.Down(); err != nil {
@@ -77,8 +84,37 @@ func TestMigrationsRoundTrip(t *testing.T) {
 	if err := m.Up(); err != nil {
 		t.Fatalf("second up: %v", err)
 	}
-	assertVersion("after second up", 4)
+	assertVersion("after second up", latest)
 	assertTables(t, ctx, cfg.Postgres.DSN(), true)
+}
+
+// latestMigrationVersion returns the highest version present in the migrations
+// directory, so this test tracks the schema instead of a hard-coded number.
+func latestMigrationVersion(t *testing.T) uint {
+	t.Helper()
+
+	entries, err := filepath.Glob(filepath.Join(migrationsPath, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("listing migrations: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("no migrations found in %s", migrationsPath)
+	}
+
+	var latest uint
+	for _, entry := range entries {
+		name := filepath.Base(entry)
+		digits, _, ok := strings.Cut(name, "_")
+		if !ok {
+			t.Fatalf("migration %q does not start with a version prefix", name)
+		}
+		version, err := strconv.ParseUint(digits, 10, 64)
+		if err != nil {
+			t.Fatalf("migration %q has a non-numeric version prefix: %v", name, err)
+		}
+		latest = max(latest, uint(version))
+	}
+	return latest
 }
 
 // assertTables checks that the ledger tables are present or absent, and that

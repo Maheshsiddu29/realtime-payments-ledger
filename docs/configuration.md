@@ -60,13 +60,35 @@ migration runner, which uses `database/sql`. See
 
 ## Redis
 
-Not connected to yet — validated only, for a later phase.
+Live: Redis coordinates idempotent requests. It is **not** part of the
+financial source of truth — see [IDEMPOTENCY.md](IDEMPOTENCY.md).
 
-| Variable         | Default          | Description                                  |
-| ---------------- | ---------------- | -------------------------------------------- |
-| `REDIS_ADDR`     | `localhost:6379` | `host:port`. `redis:6379` inside Compose.    |
-| `REDIS_PASSWORD` | *(empty)*        | Optional. Never logged.                      |
-| `REDIS_DB`       | `0`              | Logical database index.                      |
+| Variable                | Default          | Description                                  |
+| ----------------------- | ---------------- | -------------------------------------------- |
+| `REDIS_ADDR`            | `localhost:6379` | `host:port`. `redis:6379` inside Compose.    |
+| `REDIS_PASSWORD`        | *(empty)*        | Optional. Never logged.                      |
+| `REDIS_DB`              | `0`              | Logical database index.                      |
+| `REDIS_DIAL_TIMEOUT`    | `3s`             | Bounds establishing a connection.            |
+| `REDIS_COMMAND_TIMEOUT` | `1s`             | Bounds a single command, so a wedged Redis fails fast rather than stalling a payment. |
+
+## Idempotency
+
+Redis-side lifetimes only. Expiry never weakens deduplication: the UNIQUE
+constraint on `transfers.idempotency_key` is the final barrier and has no TTL.
+
+| Variable                     | Default | Description                                        |
+| ---------------------------- | ------- | -------------------------------------------------- |
+| `IDEMPOTENCY_TTL`            | `24h`   | How long a completed result stays cached.          |
+| `IDEMPOTENCY_PROCESSING_TTL` | `30s`   | Lease on an in-flight claim. A crashed holder releases the key after this. |
+
+`IDEMPOTENCY_PROCESSING_TTL` must not exceed `IDEMPOTENCY_TTL`; a lease
+outliving the result it guards would leave a key blocking payments.
+
+### Test-only
+
+| Variable        | Default | Description                                              |
+| --------------- | ------- | -------------------------------------------------------- |
+| `REDIS_TEST_DB` | `15`    | Logical Redis database the integration tests flush.      |
 
 ## Kafka
 
@@ -84,7 +106,8 @@ Not connected to yet — validated only, for a later phase.
 - `APP_ENV`, `LOG_LEVEL` or `LOG_FORMAT` is outside its allowed set.
 - A port is outside its valid range, or a numeric variable is not a number.
 - A duration is unparseable or not greater than zero, including
-  `POSTGRES_CONNECT_TIMEOUT`.
+  `POSTGRES_CONNECT_TIMEOUT`, the Redis timeouts and the idempotency TTLs.
+- `IDEMPOTENCY_PROCESSING_TTL` exceeds `IDEMPOTENCY_TTL`.
 - `POSTGRES_SSLMODE` is not a valid libpq mode.
 - `POSTGRES_MAX_IDLE_CONNS` exceeds `POSTGRES_MAX_OPEN_CONNS`.
 - `APP_ENV=production` and `POSTGRES_SSLMODE=disable`.

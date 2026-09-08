@@ -5,11 +5,11 @@ PostgreSQL with serializable transactions, Redis-backed idempotency, a gRPC
 API, a transactional outbox feeding Kafka audit events, and distributed
 tracing.
 
-> **Status: Phase 2 — concurrency safety.**
-> Accounts, transfers and ledger entries exist and are enforced by the
-> database, and transfer posting is hardened against concurrent execution.
-> Redis, Kafka, gRPC, authentication and tracing are **not implemented** —
-> see [docs/roadmap.md](docs/roadmap.md).
+> **Status: Phase 3 — Redis-backed idempotency.**
+> Accounts, transfers and ledger entries are enforced by the database, transfer
+> posting is hardened against concurrent execution, and repeated payment
+> requests are deduplicated. Kafka, gRPC, authentication and tracing are **not
+> implemented** — see [docs/roadmap.md](docs/roadmap.md).
 
 ## What works today
 
@@ -27,9 +27,16 @@ tracing.
   classified by SQLSTATE; business rejections are never retried
 - Reconciliation of stored balances against the ledger
 - A concurrent load generator with machine-readable results
+- **Idempotent transfers**: a client-supplied key means one logical payment
+  produces at most one financial transfer, however many times it is retried
+- Redis coordination (`SET NX EX` claim, cached results) with a **UNIQUE
+  constraint in PostgreSQL as the final barrier** — deduplication survives
+  Redis being unavailable, flushed or expired
+- SHA-256 request fingerprints, so reusing a key for a different payment is
+  refused rather than silently returning the first result
 
-Not implemented: Redis idempotency, Kafka, the outbox, gRPC, OAuth2/JWT,
-OpenTelemetry, Jaeger, Loki, Toxiproxy.
+Not implemented: Kafka, the outbox, gRPC, OAuth2/JWT, OpenTelemetry, Jaeger,
+Loki, Toxiproxy.
 
 **Measured, not claimed:** across three separate 1,000-attempt runs plus
 opposing-direction and four-account variants, these runs recorded zero double
@@ -39,6 +46,13 @@ proof of impossibility — see
 [docs/results/concurrency-1000.md](docs/results/concurrency-1000.md) for the
 numbers and
 [docs/CONCURRENCY.md](docs/CONCURRENCY.md#limitations) for the limits.
+
+For idempotency: across five consecutive runs under the race detector, 12
+simultaneous requests sharing one idempotency key produced **exactly one
+transfer, one debit, one credit and one distinct transfer ID**, with no data
+races. Deliberately removing the database constraint made the same tests
+produce two transfers, which is what shows where the guarantee actually lives.
+See [docs/results/idempotency-concurrency.md](docs/results/idempotency-concurrency.md).
 
 ## Quick start
 
@@ -94,7 +108,7 @@ Schema reference: [docs/DATABASE.md](docs/DATABASE.md).
 | Endpoint   | Purpose   | Behaviour                                                        |
 | ---------- | --------- | ---------------------------------------------------------------- |
 | `/healthz` | Liveness  | `200` whenever the process is serving. Never consults PostgreSQL — a database outage must not trigger a restart loop. |
-| `/readyz`  | Readiness | Runs every registered check, including PostgreSQL. `200` when all pass, `503` when any fails, so the process leaves the load-balancer rotation without being killed. |
+| `/readyz`  | Readiness | Runs every registered check. PostgreSQL is **required** — `503` if it fails. Redis is **optional**: a failure marks the response `degraded` but keeps `200`, because the service stays correct without it. |
 | `/version` | Metadata  | Build version, commit and service identity.                       |
 
 These are the *operational* endpoints. Payment operations are served over gRPC
@@ -128,6 +142,8 @@ make test                  # fast suites only, no infrastructure needed
 make test-integration      # PostgreSQL integration tests (needs make infra-up)
 make test-concurrency      # deterministic concurrency tests, verbose
 make test-concurrency-race # the same under the race detector
+make test-idempotency      # Redis idempotency tests
+make test-idempotency-race # the same under the race detector
 make verify                # everything: ci + compose config + integration + race
 make cover-html            # coverage report at coverage.html
 make binary                # build bin/api with version metadata
@@ -192,6 +208,8 @@ internal/account/   Account records and persistence
 internal/transfer/  Atomic double-entry posting, row locking, retry policy
 internal/ledger/    Read-only ledger entry access
 internal/reconcile/ Balance and ledger reconciliation checks
+internal/idempotency/ Key validation, fingerprints, Redis coordination records
+internal/redisclient/ Redis connection ownership
 internal/health/    Concurrency-safe dependency check registry
 internal/httpapi/   Operational HTTP endpoints and server lifecycle
 migrations/         Versioned up/down SQL migrations
@@ -207,6 +225,7 @@ Documentation:
 | ---------------------------------------------- | --------------------------------------------------- |
 | [docs/LEDGER_DESIGN.md](docs/LEDGER_DESIGN.md) | Double-entry accounting, money representation, invariants and exactly what enforces each one |
 | [docs/CONCURRENCY.md](docs/CONCURRENCY.md)     | Locking, retries, deadlock prevention, reconciliation and limitations |
+| [docs/IDEMPOTENCY.md](docs/IDEMPOTENCY.md)     | Idempotency keys, fingerprints, Redis state machine, duplicate recovery and failure behaviour |
 | [docs/results/](docs/results/)                 | Measured stress results, with the environment they came from |
 | [docs/DATABASE.md](docs/DATABASE.md)           | Tables, constraints, indexes, triggers, migrations, transaction boundaries |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)   | Package layout and design decisions                 |
@@ -217,22 +236,25 @@ Documentation:
 
 | Service    | Image                | Host port | Used by the app? |
 | ---------- | -------------------- | --------- | ---------------- |
-| PostgreSQL | `postgres:16-alpine` | 5432      | **Yes**          |
-| Redis      | `redis:7-alpine`     | 6379      | No — later phase |
+| PostgreSQL | `postgres:16-alpine` | 5432      | **Yes** — financial source of truth |
+| Redis      | `redis:7-alpine`     | 6379      | **Yes** — idempotency coordination only |
 | Kafka      | `apache/kafka:3.8.0` | 29092     | No — later phase |
 | API        | built from source    | 8080      | —                |
 
-Redis and Kafka are provisioned so later phases build against a stable
-environment. Nothing in the application connects to them yet.
+Kafka is provisioned so a later phase builds against a stable environment;
+nothing connects to it yet. Redis is used for request coordination and is
+never a financial correctness boundary — a Redis outage degrades speed, not
+safety, and `/readyz` reports it as `degraded` rather than unready.
 
 ## Technology
 
 Go · PostgreSQL · Redis · Kafka · gRPC · OAuth2/JWT · OpenTelemetry · Jaeger ·
 Loki · Toxiproxy · Docker Compose · GitHub Actions
 
-Implemented so far: Go, PostgreSQL, Docker Compose, GitHub Actions. Three
-direct Go dependencies — `pgx/v5`, `google/uuid` and `golang-migrate` — with
-the standard library covering logging, HTTP, randomness and error handling.
+Implemented so far: Go, PostgreSQL, Redis, Docker Compose, GitHub Actions.
+Four direct Go dependencies — `pgx/v5`, `google/uuid`, `golang-migrate` and
+`go-redis/v9` — with the standard library covering logging, HTTP, hashing,
+randomness and error handling.
 
 ## Repository rules
 

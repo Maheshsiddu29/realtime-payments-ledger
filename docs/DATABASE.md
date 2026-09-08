@@ -48,6 +48,8 @@ The intent to move money, and its outcome.
 | `status`                 | `TEXT`        | `pending`, `completed` or `failed`.    |
 | `created_at`             | `TIMESTAMPTZ` | Set by the database.                   |
 | `completed_at`           | `TIMESTAMPTZ` | Set if and only if `status='completed'`. |
+| `idempotency_key`        | `TEXT`        | Client-supplied, **UNIQUE**. NULL for internally originated transfers. |
+| `request_fingerprint`    | `BYTEA`       | SHA-256 of the canonical request. 32 bytes when present. |
 
 Constraints:
 
@@ -58,6 +60,16 @@ Constraints:
 | `transfers_status_valid`                 | `status IN ('pending','completed','failed')`      | Closed set of states.                                    |
 | `transfers_distinct_accounts`            | `source_account_id <> destination_account_id`     | A self-transfer would be a balanced pair that moves nothing. |
 | `transfers_completed_at_matches_status`  | `completed_at IS NOT NULL` iff completed          | The two columns can never disagree.                     |
+| `transfers_idempotency_key_unique`       | `UNIQUE (idempotency_key)`                        | **The final barrier against a duplicate financial posting.** NULLs are distinct, so keyless transfers are unaffected. |
+| `transfers_idempotency_key_length`       | 1–255 characters when present                     | Unbounded input in a unique index is a denial-of-service surface. |
+| `transfers_request_fingerprint_length`   | exactly 32 bytes when present                     | A SHA-256 digest, nothing else.                          |
+| `transfers_idempotency_pairing`          | key and fingerprint both NULL or both set         | A key without a fingerprint could not detect a mismatched replay. |
+
+The idempotency key is written by the same `INSERT` that creates the transfer,
+so the UNIQUE constraint decides the winner atomically — there is no window in
+which a key is reserved but its transfer does not exist, and no second table to
+keep consistent. Recovering the original transfer after a duplicate is a single
+indexed lookup. See [IDEMPOTENCY.md](IDEMPOTENCY.md).
 
 `status` is `TEXT` with a `CHECK` rather than an `ENUM`. Adding a state later
 is then an ordinary migration instead of `ALTER TYPE`, which has awkward

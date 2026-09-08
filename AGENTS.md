@@ -58,13 +58,17 @@ logging, concurrency testing, chaos testing, CI/CD.
   Deterministic UUID-ordered row locking, bounded retry on SQLSTATE 40001 and
   40P01, reconciliation checks, concurrency and deadlock regression tests, a
   stress runner, and measured results in `docs/results/`.
-- **Phase 3 and later: not started.** Do not begin the next phase without an
+- **Phase 3 — Redis-backed idempotency: complete.**
+  Idempotency keys persisted with a UNIQUE constraint, request fingerprinting,
+  Redis claim/completion records, duplicate recovery from PostgreSQL, and
+  integration tests covering every Redis failure mode.
+- **Phase 4 and later: not started.** Do not begin the next phase without an
   explicit instruction.
 
 Anything not present in the tree is deliberately out of scope for the current
-phase. Do not implement Redis idempotency, authentication, gRPC, Kafka
-producers, the outbox, observability exporters or chaos testing until the phase
-that owns them is requested.
+phase. Do not implement authentication, gRPC, Kafka producers, the outbox,
+observability exporters or chaos testing until the phase that owns them is
+requested.
 
 ## 4. Engineering conventions
 
@@ -102,6 +106,14 @@ that owns them is requested.
 - **Claims.** An executed test supports "observed X in this run", never "X is
   impossible". Record the machine, database version and command alongside any
   measurement, and keep results in `docs/results/`.
+- **Redis is never a correctness boundary.** It coordinates and caches. Every
+  guarantee it appears to provide must also hold with Redis flushed,
+  unavailable or expired, and that fallback must be tested rather than assumed.
+  Never use Redis to lock an account balance; PostgreSQL row locks are
+  authoritative.
+- **Idempotency.** A key is opaque and bounded. Reuse with a different request
+  fingerprint is a conflict and must never execute. Completed results may be
+  cached; business rejections must not be.
 
 ## 5. Validation gate
 
@@ -121,7 +133,7 @@ go vet -tags=integration ./...
 go build ./...
 go test ./...
 go test -race ./...
-go test -tags=integration ./...        # needs PostgreSQL: make infra-up
+go test -tags=integration ./...        # needs PostgreSQL and Redis: make infra-up
 go test -race -tags=integration ./...
 docker compose config                  # must parse
 ```

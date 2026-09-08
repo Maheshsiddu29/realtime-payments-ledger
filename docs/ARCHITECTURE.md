@@ -49,8 +49,13 @@ serves health endpoints, posts double-entry transfers, and shuts down cleanly.
               └─────────────────────┘
 ```
 
-Redis and Kafka are still provided by Docker Compose but **the application does
-not connect to them.** They exist so later phases build against a stable local
+Redis is now connected: it coordinates idempotent requests. It is deliberately
+**not** part of the financial source of truth — the UNIQUE constraint on
+`transfers.idempotency_key` is what prevents duplicate transfers, and it keeps
+working while Redis is down. See [IDEMPOTENCY.md](IDEMPOTENCY.md).
+
+Kafka is still provided by Docker Compose but **the application does not
+connect to it.** It exists so later phases build against a stable local
 environment.
 
 ## Package layout
@@ -67,6 +72,8 @@ environment.
 | `internal/transfer` | Atomic double-entry posting, row locking and the retry policy.         |
 | `internal/ledger`   | Read-only access to ledger entries.                                    |
 | `internal/reconcile`| Verifies stored balances and ledger entries against each other.        |
+| `internal/idempotency`| Key validation, request fingerprints and the Redis coordination record. No financial logic. |
+| `internal/redisclient`| Owns the Redis connection.                                           |
 | `internal/health`   | Concurrency-safe registry of named dependency checks.                  |
 | `internal/httpapi`  | Operational HTTP surface and server lifecycle.                         |
 | `tests`             | End-to-end, integration and concurrency tests.                         |
@@ -141,6 +148,23 @@ the debit always lands on the source, whichever row was locked first.
 Serialization failures are retried under a bounded policy outside the
 transaction. See [CONCURRENCY.md](CONCURRENCY.md).
 
+### Redis coordinates, PostgreSQL decides
+
+Idempotency is layered so that Redis can fail in any way without permitting a
+duplicate payment. Redis makes duplicate detection fast — a single
+`SET NX EX` claim and a cached result — while the UNIQUE constraint on
+`transfers.idempotency_key` is what actually guarantees at most one transfer
+per key.
+
+Every Redis failure mode therefore degrades performance rather than
+correctness, and each is tested: unavailable before the transfer (the request
+falls back to PostgreSQL), unavailable after the commit, flushed, expired, and
+lost because the process died between `COMMIT` and the cache write. All of them
+recover the original transfer through the database.
+
+Redis is never used to lock an account. Balance safety remains entirely the
+row locking and `SERIALIZABLE` transactions of Phase 2, which are unchanged.
+
 ### The ledger package cannot write
 
 `internal/ledger` exposes no way to create, update or delete an entry. Entries
@@ -170,6 +194,7 @@ Phase 0 had none. Phase 1 adds exactly three direct dependencies:
 | `github.com/jackc/pgx/v5`         | PostgreSQL driver and connection pool.   |
 | `github.com/google/uuid`          | UUID generation for identifiers.         |
 | `github.com/golang-migrate/migrate/v4` | Schema migrations, used only by `cmd/migrate` and the test harness. |
+| `github.com/redis/go-redis/v9`    | Redis client for idempotency coordination. |
 
 Structured logging is still `log/slog`, and the HTTP surface is still
 `net/http`.
@@ -179,7 +204,7 @@ Structured logging is still `log/slog`, and the HTTP surface is still
 | Service    | Image                | Host port | Used by the app? |
 | ---------- | -------------------- | --------- | ---------------- |
 | PostgreSQL | `postgres:16-alpine` | 5432      | **Yes**          |
-| Redis      | `redis:7-alpine`     | 6379      | No — later phase |
+| Redis      | `redis:7-alpine`     | 6379      | **Yes** — idempotency coordination |
 | Kafka      | `apache/kafka:3.8.0` | 29092     | No — later phase |
 | API        | built from source    | 8080      | —                |
 
@@ -192,9 +217,8 @@ name fails loudly instead of creating a phantom stream.
 
 ## What is deliberately absent
 
-Redis idempotency, OAuth2/JWT authentication, the gRPC server, the
-transactional outbox, the Kafka producer, OpenTelemetry tracing, and chaos
-testing. Each belongs to a later phase; see [roadmap.md](roadmap.md).
+OAuth2/JWT authentication, the gRPC server, the transactional outbox, the
+Kafka producer, OpenTelemetry tracing, and chaos testing. Each belongs to a later phase; see [roadmap.md](roadmap.md).
 
 Retry counts are returned in-process through `transfer.Attempts` and consumed
 by tests and the load generator. No metrics are exported: Prometheus and

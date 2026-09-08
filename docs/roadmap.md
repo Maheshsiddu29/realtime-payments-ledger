@@ -48,12 +48,21 @@ Design and limitations: [CONCURRENCY.md](CONCURRENCY.md).
 Not done in this phase: per-account admission control, which the measurements
 show is the real fix for a hot account.
 
-## Phase 3 — Idempotency
+## Phase 3 — Idempotency ✅ complete
 
-- Redis-backed idempotency keys with a first-writer-wins claim.
-- Replay of a completed request returns the original response; a concurrent
-  duplicate is rejected rather than double-applied.
-- Redis readiness check registered.
+- Idempotency keys persisted on `transfers` with a UNIQUE constraint: the
+  final barrier against a duplicate financial posting, independent of Redis.
+- SHA-256 request fingerprints, stored in both Redis and PostgreSQL, so a key
+  reused for a different payment is refused and never executed.
+- Redis claim via a single `SET NX EX`, completion records with a 24 h TTL,
+  and a 30 s processing lease so a crashed holder cannot block a key.
+- Duplicate recovery from PostgreSQL covering Redis being unavailable,
+  flushed, expired, or lost between `COMMIT` and the cache write.
+- Redis registered as an **optional** readiness check: a Redis outage degrades
+  the service without withdrawing traffic.
+- Results: [results/idempotency-concurrency.md](results/idempotency-concurrency.md).
+
+Design and limitations: [IDEMPOTENCY.md](IDEMPOTENCY.md).
 
 ## Phase 4 — gRPC API and authentication
 

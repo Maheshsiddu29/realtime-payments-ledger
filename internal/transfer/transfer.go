@@ -106,22 +106,100 @@ func (c Command) Validate() error {
 
 // Service posts transfers and reads them back.
 type Service struct {
-	pool *pgxpool.Pool
-	log  *slog.Logger
+	pool  *pgxpool.Pool
+	log   *slog.Logger
+	retry RetryPolicy
 }
 
-// NewService returns a transfer service backed by the given pool.
+// NewService returns a transfer service using DefaultRetryPolicy.
 func NewService(pool *pgxpool.Pool, log *slog.Logger) *Service {
-	return &Service{pool: pool, log: log}
+	return NewServiceWithPolicy(pool, log, DefaultRetryPolicy)
 }
+
+// NewServiceWithPolicy returns a transfer service with an explicit retry
+// policy. Tests use it to make retry behaviour observable without waiting on
+// the production backoff.
+func NewServiceWithPolicy(pool *pgxpool.Pool, log *slog.Logger, policy RetryPolicy) *Service {
+	if policy.MaxAttempts < 1 {
+		policy.MaxAttempts = 1
+	}
+	return &Service{pool: pool, log: log, retry: policy}
+}
+
+// RetryPolicy returns the policy this service applies.
+func (s *Service) RetryPolicy() RetryPolicy { return s.retry }
 
 // Post moves money atomically and returns the completed transfer.
 //
+// It runs postOnce inside a bounded retry loop. Keeping the retry policy out
+// of the transaction body means transactional correctness and retry policy can
+// be reviewed — and tested — separately, and that the transfer logic exists in
+// exactly one place.
+func (s *Service) Post(ctx context.Context, cmd Command) (Transfer, error) {
+	posted, _, err := s.PostWithAttempts(ctx, cmd)
+	return posted, err
+}
+
+// PostWithAttempts is Post, additionally reporting how much contention the
+// call encountered. Tests and the load generator use it to count retries;
+// ordinary callers should use Post.
+//
+// Only SQLSTATE 40001 and 40P01 are retried. Business rejections —
+// insufficient funds, unknown account, currency mismatch, invalid amount — are
+// never PgErrors and are returned on the first attempt, so a caller can never
+// have a refusal silently retried into a success.
+func (s *Service) PostWithAttempts(ctx context.Context, cmd Command) (Transfer, Attempts, error) {
+	var attempts Attempts
+
+	// Validation needs no database, so a malformed command costs no attempt.
+	if err := cmd.Validate(); err != nil {
+		return Transfer{}, attempts, err
+	}
+
+	for attempt := 1; ; attempt++ {
+		attempts.Total = attempt
+
+		posted, err := s.postOnce(ctx, cmd)
+		if err == nil {
+			if attempt > 1 {
+				s.log.InfoContext(ctx, "transfer posted after contention",
+					slog.String("transfer_id", posted.ID.String()),
+					slog.Int("attempts", attempt),
+					slog.Int("serialization_failures", attempts.SerializationFailures),
+					slog.Int("deadlocks", attempts.Deadlocks),
+				)
+			}
+			return posted, attempts, nil
+		}
+
+		code, retryable := retryableCode(err)
+		if !retryable {
+			return Transfer{}, attempts, err
+		}
+		attempts.record(code)
+
+		if attempt >= s.retry.MaxAttempts {
+			// Bounded: the loop always terminates here, whatever the load.
+			return Transfer{}, attempts, fmt.Errorf("%w after %d attempts (last SQLSTATE %s): %w",
+				ErrRetriesExhausted, attempt, code, err)
+		}
+
+		// A cancelled request stops immediately rather than finishing its
+		// backoff.
+		if err := s.retry.wait(ctx, attempt); err != nil {
+			return Transfer{}, attempts, fmt.Errorf("transfer: retry cancelled after %d attempts: %w", attempt, err)
+		}
+	}
+}
+
+// postOnce performs exactly one attempt: one transaction, from BEGIN to
+// COMMIT. It contains no retry logic of any kind.
+//
 // Everything happens inside one SERIALIZABLE transaction:
 //
-//  1. validate the command
-//  2. lock both account rows in a canonical order and read them
-//  3. check they exist, share a currency, and match the transfer currency
+//  1. lock both account rows in a canonical order
+//  2. read the locked source and destination state
+//  3. check both exist, share a currency, and match the transfer currency
 //  4. check the source has enough money
 //  5. insert the transfer as pending
 //  6. debit the source with a guarded UPDATE
@@ -134,16 +212,11 @@ func NewService(pool *pgxpool.Pool, log *slog.Logger) *Service {
 // Any error at any step rolls the whole thing back, so there is no state in
 // which the source is debited without the destination being credited, or a
 // transfer is completed without its ledger entries.
-func (s *Service) Post(ctx context.Context, cmd Command) (Transfer, error) {
-	if err := cmd.Validate(); err != nil {
-		return Transfer{}, err
-	}
-
+func (s *Service) postOnce(ctx context.Context, cmd Command) (Transfer, error) {
 	// SERIALIZABLE is the strongest isolation PostgreSQL offers: concurrent
-	// transactions behave as if they ran one after another. Phase 1 does not
-	// retry on serialization failure (SQLSTATE 40001) — such an error is
-	// returned to the caller. Deterministic lock ordering and a retry loop are
-	// Phase 2 work; see docs/LEDGER_DESIGN.md.
+	// transactions behave as if they had run one after another. It is kept
+	// even though explicit row locking was added, because the two protect
+	// different things — see docs/CONCURRENCY.md.
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return Transfer{}, fmt.Errorf("transfer: begin: %w", err)
@@ -163,7 +236,10 @@ func (s *Service) Post(ctx context.Context, cmd Command) (Transfer, error) {
 	}
 
 	// The deferred constraint triggers run here. If the entries somehow did
-	// not balance, the COMMIT itself fails and nothing is durable.
+	// not balance, the COMMIT itself fails and nothing is durable. A
+	// serialization failure also surfaces here rather than at a statement,
+	// which is why the commit error is returned unwrapped by any business
+	// error type — the retry loop needs to see its SQLSTATE.
 	if err := tx.Commit(ctx); err != nil {
 		return Transfer{}, fmt.Errorf("transfer: commit: %w", err)
 	}
@@ -178,9 +254,9 @@ func (s *Service) Post(ctx context.Context, cmd Command) (Transfer, error) {
 	return posted, nil
 }
 
-// post carries out the work inside an open transaction. Splitting it from Post
-// keeps the commit/rollback handling in one place and lets every step here
-// simply return an error.
+// post carries out the work inside an open transaction. Splitting it from
+// postOnce keeps the commit/rollback handling in one place and lets every step
+// here simply return an error.
 func (s *Service) post(ctx context.Context, tx pgx.Tx, cmd Command) (Transfer, error) {
 	source, destination, err := lockAccounts(ctx, tx, cmd.SourceAccountID, cmd.DestinationAccountID)
 	if err != nil {
@@ -202,7 +278,10 @@ func (s *Service) post(ctx context.Context, tx pgx.Tx, cmd Command) (Transfer, e
 	// The balance was read under FOR UPDATE, so no concurrent transfer can
 	// change it before this transaction ends: this check is now authoritative
 	// as well as producing a precise error. The guarded UPDATE below and the
-	// non-negative CHECK constraint are kept as defence in depth.
+	// non-negative CHECK constraint are kept as defence in depth — they are
+	// what would still stop an overdraft if this locking were ever weakened,
+	// which was verified by removing this check and observing the constraint
+	// hold.
 	if source.balanceMinor < cmd.AmountMinor {
 		return Transfer{}, fmt.Errorf("%w: account %s holds %d, needs %d",
 			ErrInsufficientFunds, source.id, source.balanceMinor, cmd.AmountMinor)
@@ -231,8 +310,9 @@ func (s *Service) post(ctx context.Context, tx pgx.Tx, cmd Command) (Transfer, e
 	}
 
 	// Guarded debit: the WHERE clause re-checks the balance as part of the
-	// same statement, so the funds cannot be spent between the read above and
-	// this write. Zero rows affected means the balance moved underneath us.
+	// same statement. With the row locked this cannot fail, which is exactly
+	// why it stays — if it ever does fail, the locking is broken and the
+	// transfer must be rejected rather than proceed on a stale read.
 	const debit = `
 		UPDATE accounts
 		SET balance_minor = balance_minor - $2

@@ -7,6 +7,7 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -119,7 +120,7 @@ func NewService(pool *pgxpool.Pool, log *slog.Logger) *Service {
 // Everything happens inside one SERIALIZABLE transaction:
 //
 //  1. validate the command
-//  2. load both accounts
+//  2. lock both account rows in a canonical order and read them
 //  3. check they exist, share a currency, and match the transfer currency
 //  4. check the source has enough money
 //  5. insert the transfer as pending
@@ -181,19 +182,8 @@ func (s *Service) Post(ctx context.Context, cmd Command) (Transfer, error) {
 // keeps the commit/rollback handling in one place and lets every step here
 // simply return an error.
 func (s *Service) post(ctx context.Context, tx pgx.Tx, cmd Command) (Transfer, error) {
-	source, err := loadAccount(ctx, tx, cmd.SourceAccountID)
+	source, destination, err := lockAccounts(ctx, tx, cmd.SourceAccountID, cmd.DestinationAccountID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return Transfer{}, fmt.Errorf("%w: %s", ErrSourceAccountNotFound, cmd.SourceAccountID)
-		}
-		return Transfer{}, err
-	}
-
-	destination, err := loadAccount(ctx, tx, cmd.DestinationAccountID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return Transfer{}, fmt.Errorf("%w: %s", ErrDestinationAccountNotFound, cmd.DestinationAccountID)
-		}
 		return Transfer{}, err
 	}
 
@@ -209,9 +199,10 @@ func (s *Service) post(ctx context.Context, tx pgx.Tx, cmd Command) (Transfer, e
 			ErrCurrencyMismatch, destination.currency, cmd.Currency)
 	}
 
-	// Checked here for a precise error message. The authority is the guarded
-	// UPDATE below, which cannot be raced past, plus the non-negative CHECK
-	// constraint on the column.
+	// The balance was read under FOR UPDATE, so no concurrent transfer can
+	// change it before this transaction ends: this check is now authoritative
+	// as well as producing a precise error. The guarded UPDATE below and the
+	// non-negative CHECK constraint are kept as defence in depth.
 	if source.balanceMinor < cmd.AmountMinor {
 		return Transfer{}, fmt.Errorf("%w: account %s holds %d, needs %d",
 			ErrInsufficientFunds, source.id, source.balanceMinor, cmd.AmountMinor)
@@ -313,15 +304,95 @@ type account struct {
 	balanceMinor int64
 }
 
-func loadAccount(ctx context.Context, tx pgx.Tx, id uuid.UUID) (account, error) {
-	const query = `SELECT id, currency, balance_minor FROM accounts WHERE id = $1`
+// lockOrder returns the two account ids in canonical order: the numerically
+// smaller UUID first, comparing the raw 16 bytes.
+//
+// This is the whole of the deadlock-prevention strategy. Two transfers in
+// opposite directions over the same pair of accounts — A to B and B to A —
+// would, if each locked its own source first, take the two row locks in
+// opposite orders and could form a cycle: each holds one row and waits for the
+// other. PostgreSQL breaks such a cycle by aborting one transaction with
+// SQLSTATE 40P01.
+//
+// Sorting by UUID makes the acquisition order a property of the *pair* of
+// accounts rather than of the direction of the transfer, so every transaction
+// touching the same two rows requests them in the same sequence and no cycle
+// can form. Any total order would do; UUID byte order is used because it is
+// already available, stable, and free of ties.
+func lockOrder(a, b uuid.UUID) (first, second uuid.UUID) {
+	if bytes.Compare(a[:], b[:]) <= 0 {
+		return a, b
+	}
+	return b, a
+}
+
+// lockAccounts takes a row-level write lock on both accounts in canonical
+// order and returns them mapped back to their business roles.
+//
+// Lock acquisition order and business meaning are deliberately kept apart. The
+// rows are locked lowest-UUID-first, but the returned source and destination
+// are resolved by matching ids, never by which row happened to be locked
+// first. Debiting "whichever row was locked first" would silently reverse half
+// of all transfers.
+func lockAccounts(ctx context.Context, tx pgx.Tx, sourceID, destinationID uuid.UUID) (source, destination account, err error) {
+	first, second := lockOrder(sourceID, destinationID)
+
+	// Two statements rather than one `WHERE id = ANY(...) ORDER BY id FOR
+	// UPDATE`: with a single statement the order in which rows are locked
+	// depends on the query plan, and the ordering guarantee is exactly what
+	// this function exists to provide. Two round trips is a small price for an
+	// order that is obvious from the code.
+	lockedFirst, err := lockAccount(ctx, tx, first)
+	if err != nil {
+		return account{}, account{}, missingAccountError(err, first, sourceID)
+	}
+
+	lockedSecond, err := lockAccount(ctx, tx, second)
+	if err != nil {
+		return account{}, account{}, missingAccountError(err, second, sourceID)
+	}
+
+	// Map back by identity, not by lock position.
+	if lockedFirst.id == sourceID {
+		return lockedFirst, lockedSecond, nil
+	}
+	return lockedSecond, lockedFirst, nil
+}
+
+// missingAccountError attributes a missing row to the correct business role,
+// so the caller learns which side of the transfer was wrong.
+func missingAccountError(err error, lockedID, sourceID uuid.UUID) error {
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if lockedID == sourceID {
+		return fmt.Errorf("%w: %s", ErrSourceAccountNotFound, lockedID)
+	}
+	return fmt.Errorf("%w: %s", ErrDestinationAccountNotFound, lockedID)
+}
+
+// lockAccount reads one account row and holds a write lock on it until the
+// transaction ends.
+//
+// FOR UPDATE is what serialises the read-modify-write on a balance: a
+// concurrent transfer touching the same account blocks here instead of reading
+// a balance that is about to change. Under SERIALIZABLE alone the conflict
+// would still be caught, but only at COMMIT and only by aborting one
+// transaction — blocking briefly is far cheaper than doing the whole transfer
+// twice.
+func lockAccount(ctx context.Context, tx pgx.Tx, id uuid.UUID) (account, error) {
+	const query = `
+		SELECT id, currency, balance_minor
+		FROM accounts
+		WHERE id = $1
+		FOR UPDATE`
 
 	var a account
 	if err := tx.QueryRow(ctx, query, id).Scan(&a.id, &a.currency, &a.balanceMinor); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return account{}, err
 		}
-		return account{}, fmt.Errorf("transfer: load account %s: %w", id, err)
+		return account{}, fmt.Errorf("transfer: lock account %s: %w", id, err)
 	}
 	return a, nil
 }

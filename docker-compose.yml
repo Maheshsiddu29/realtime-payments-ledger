@@ -52,10 +52,17 @@ services:
     container_name: ledger-redis
     restart: unless-stopped
     command:
-      # Idempotency keys must survive a restart, so persistence is on.
+      # Persistence is on so a restart does not drop in-flight coordination.
+      # Note that losing it would not permit a duplicate payment — the UNIQUE
+      # constraint on transfers.idempotency_key is the real barrier — but it
+      # would send replays to the database unnecessarily.
       - redis-server
       - --appendonly
       - "yes"
+      # noeviction rather than an LRU policy: silently evicting an idempotency
+      # record under memory pressure would turn a replay into a database
+      # lookup, and evicting a PROCESSING claim would let a second request
+      # start. Neither breaks correctness, but both are better refused loudly.
       - --maxmemory-policy
       - noeviction
     ports:
@@ -139,6 +146,10 @@ services:
       POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-disable}
       REDIS_ADDR: redis:6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_DIAL_TIMEOUT: ${REDIS_DIAL_TIMEOUT:-3s}
+      REDIS_COMMAND_TIMEOUT: ${REDIS_COMMAND_TIMEOUT:-1s}
+      IDEMPOTENCY_TTL: ${IDEMPOTENCY_TTL:-24h}
+      IDEMPOTENCY_PROCESSING_TTL: ${IDEMPOTENCY_PROCESSING_TTL:-30s}
       KAFKA_BROKERS: kafka:9092
       KAFKA_AUDIT_TOPIC: ${KAFKA_AUDIT_TOPIC:-ledger.audit.v1}
     ports:

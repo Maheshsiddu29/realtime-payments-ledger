@@ -96,6 +96,19 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # Redis coordinates idempotent requests. It is not the correctness
+      # boundary — the UNIQUE constraint on transfers.idempotency_key is — but
+      # the coordination path and its failure modes both need testing.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       POSTGRES_HOST: localhost
       POSTGRES_PORT: 5432
@@ -105,6 +118,9 @@ jobs:
       # A dedicated database, created and migrated by the test harness, so a
       # test run can never touch application data.
       POSTGRES_TEST_DB: ledger_test
+      REDIS_ADDR: localhost:6379
+      # A dedicated logical Redis database the harness is free to flush.
+      REDIS_TEST_DB: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -137,6 +153,12 @@ jobs:
       # immediately legible.
       - name: Deterministic concurrency tests
         run: make test-concurrency
+
+      # Redis-backed idempotency, including the same-key concurrency case and
+      # every Redis failure mode: unavailable, flushed, expired, and lost
+      # between COMMIT and the cache write.
+      - name: Redis idempotency tests
+        run: make test-idempotency
 
       # Concurrency correctness has to hold under the race detector too. A
       # database serialization conflict is not a Go data race; both must be

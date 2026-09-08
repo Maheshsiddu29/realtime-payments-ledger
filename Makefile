@@ -26,6 +26,9 @@ INTEGRATION_TAG := integration
 # scenarios live in cmd/stress and are run on demand.
 CONCURRENCY_TESTS := 'TestConcurrent|TestOpposing|TestLockOrder|TestMultiAccount|TestProgressive|TestBusinessRejections|TestValidationFailures|TestCancelledContext'
 
+# The Redis-backed idempotency tests, including the same-key concurrency case.
+IDEMPOTENCY_TESTS := 'TestSameKey|TestDifferentKeys|TestRetryAfter|TestLostResponse|TestRedis|TestCrash|TestStale|TestPostgresUniquenessAlone|TestRejected|TestInvalidIdempotency|TestIdempotentPosts'
+
 # Stress runner defaults, overridable: make stress ATTEMPTS=500 SCENARIO=ring
 ATTEMPTS   ?= 100
 CONCURRENCY ?= 0
@@ -124,6 +127,18 @@ test-concurrency:
 test-concurrency-race:
 	go test -tags=$(INTEGRATION_TAG) -race -count=1 -timeout 20m -v \
 		-run $(CONCURRENCY_TESTS) ./tests/
+
+## test-idempotency: Run the Redis idempotency tests (needs make infra-up).
+.PHONY: test-idempotency
+test-idempotency:
+	go test -tags=$(INTEGRATION_TAG) -count=1 -timeout 15m -v \
+		-run $(IDEMPOTENCY_TESTS) ./tests/
+
+## test-idempotency-race: Idempotency tests under the race detector.
+.PHONY: test-idempotency-race
+test-idempotency-race:
+	go test -tags=$(INTEGRATION_TAG) -race -count=1 -timeout 20m -v \
+		-run $(IDEMPOTENCY_TESTS) ./tests/
 
 ## test-all: Run every suite, fast and integration.
 .PHONY: test-all
@@ -256,6 +271,16 @@ compose-config:
 .PHONY: infra-up
 infra-up:
 	$(COMPOSE) up -d --wait postgres redis kafka
+
+## redis-up: Start Redis alone and wait until it is healthy.
+.PHONY: redis-up
+redis-up:
+	$(COMPOSE) up -d --wait redis
+
+## redis-cli: Open a redis-cli session against the Compose Redis.
+.PHONY: redis-cli
+redis-cli:
+	$(COMPOSE) exec redis redis-cli
 
 ## up: Start the full stack, including the API container.
 .PHONY: up

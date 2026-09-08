@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/idempotency"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/money"
 )
 
@@ -109,6 +110,10 @@ type Service struct {
 	pool  *pgxpool.Pool
 	log   *slog.Logger
 	retry RetryPolicy
+	// idem coordinates duplicate requests. A nil store disables coordination
+	// and leaves PostgreSQL uniqueness as the only deduplication, which is
+	// still correct — see PostIdempotent.
+	idem *idempotency.Store
 }
 
 // NewService returns a transfer service using DefaultRetryPolicy.
@@ -124,6 +129,18 @@ func NewServiceWithPolicy(pool *pgxpool.Pool, log *slog.Logger, policy RetryPoli
 		policy.MaxAttempts = 1
 	}
 	return &Service{pool: pool, log: log, retry: policy}
+}
+
+// WithIdempotency returns a service that coordinates duplicate requests
+// through the given store.
+//
+// A nil store is valid: PostIdempotent then relies on the PostgreSQL UNIQUE
+// constraint alone, which still guarantees at most one transfer per key. Redis
+// makes duplicate detection fast; it is not what makes it correct.
+func (s *Service) WithIdempotency(store *idempotency.Store) *Service {
+	clone := *s
+	clone.idem = store
+	return &clone
 }
 
 // RetryPolicy returns the policy this service applies.
@@ -149,6 +166,13 @@ func (s *Service) Post(ctx context.Context, cmd Command) (Transfer, error) {
 // never PgErrors and are returned on the first attempt, so a caller can never
 // have a refusal silently retried into a success.
 func (s *Service) PostWithAttempts(ctx context.Context, cmd Command) (Transfer, Attempts, error) {
+	return s.postWithRetry(ctx, cmd, nil)
+}
+
+// postWithRetry is the bounded retry loop. stamp, when non-nil, persists the
+// idempotency key and request fingerprint with the transfer row, which is what
+// arms the UNIQUE constraint.
+func (s *Service) postWithRetry(ctx context.Context, cmd Command, stamp *idempotencyStamp) (Transfer, Attempts, error) {
 	var attempts Attempts
 
 	// Validation needs no database, so a malformed command costs no attempt.
@@ -159,7 +183,7 @@ func (s *Service) PostWithAttempts(ctx context.Context, cmd Command) (Transfer, 
 	for attempt := 1; ; attempt++ {
 		attempts.Total = attempt
 
-		posted, err := s.postOnce(ctx, cmd)
+		posted, err := s.postOnce(ctx, cmd, stamp)
 		if err == nil {
 			if attempt > 1 {
 				s.log.InfoContext(ctx, "transfer posted after contention",
@@ -212,7 +236,7 @@ func (s *Service) PostWithAttempts(ctx context.Context, cmd Command) (Transfer, 
 // Any error at any step rolls the whole thing back, so there is no state in
 // which the source is debited without the destination being credited, or a
 // transfer is completed without its ledger entries.
-func (s *Service) postOnce(ctx context.Context, cmd Command) (Transfer, error) {
+func (s *Service) postOnce(ctx context.Context, cmd Command, stamp *idempotencyStamp) (Transfer, error) {
 	// SERIALIZABLE is the strongest isolation PostgreSQL offers: concurrent
 	// transactions behave as if they had run one after another. It is kept
 	// even though explicit row locking was added, because the two protect
@@ -230,7 +254,7 @@ func (s *Service) postOnce(ctx context.Context, cmd Command) (Transfer, error) {
 		}
 	}()
 
-	posted, err := s.post(ctx, tx, cmd)
+	posted, err := s.post(ctx, tx, cmd, stamp)
 	if err != nil {
 		return Transfer{}, err
 	}
@@ -257,7 +281,7 @@ func (s *Service) postOnce(ctx context.Context, cmd Command) (Transfer, error) {
 // post carries out the work inside an open transaction. Splitting it from
 // postOnce keeps the commit/rollback handling in one place and lets every step
 // here simply return an error.
-func (s *Service) post(ctx context.Context, tx pgx.Tx, cmd Command) (Transfer, error) {
+func (s *Service) post(ctx context.Context, tx pgx.Tx, cmd Command, stamp *idempotencyStamp) (Transfer, error) {
 	source, destination, err := lockAccounts(ctx, tx, cmd.SourceAccountID, cmd.DestinationAccountID)
 	if err != nil {
 		return Transfer{}, err
@@ -297,13 +321,19 @@ func (s *Service) post(ctx context.Context, tx pgx.Tx, cmd Command) (Transfer, e
 		Status:               StatusPending,
 	}
 
+	// The idempotency key is written by the same INSERT that creates the
+	// transfer, so the UNIQUE constraint decides the winner atomically. There
+	// is no window in which a key is reserved but its transfer does not exist.
 	const insertTransfer = `
-		INSERT INTO transfers (id, source_account_id, destination_account_id, amount_minor, currency, status)
-		VALUES ($1, $2, $3, $4, $5, 'pending')
+		INSERT INTO transfers (id, source_account_id, destination_account_id,
+		                       amount_minor, currency, status,
+		                       idempotency_key, request_fingerprint)
+		VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
 		RETURNING created_at`
 	err = tx.QueryRow(ctx, insertTransfer,
 		created.ID, created.SourceAccountID, created.DestinationAccountID,
 		created.AmountMinor, created.Currency,
+		stamp.keyOrNil(), stamp.fingerprintOrNil(),
 	).Scan(&created.CreatedAt)
 	if err != nil {
 		return Transfer{}, fmt.Errorf("transfer: insert: %w", err)

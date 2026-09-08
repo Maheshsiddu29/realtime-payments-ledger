@@ -17,6 +17,8 @@ import (
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/database"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/health"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/httpapi"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/idempotency"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/redisclient"
 )
 
 // Build metadata, injected at link time by the Makefile.
@@ -82,8 +84,28 @@ func run(ctx context.Context) error {
 			slog.String("error", err.Error()))
 	}
 
+	// Redis coordinates idempotent requests. It is deliberately NOT part of
+	// the financial source of truth: the UNIQUE constraint on
+	// transfers.idempotency_key is what prevents duplicate transfers, and it
+	// keeps working while Redis is down.
+	redisClient := redisclient.New(cfg, log)
+	defer redisClient.Close()
+
+	if err := redisClient.Verify(ctx); err != nil {
+		log.ErrorContext(ctx, "redis is not reachable at start-up; idempotency will fall back to postgres uniqueness",
+			slog.String("error", err.Error()))
+	}
+
+	store := idempotency.NewStore(redisClient.Redis(), cfg)
+
 	registry := health.New(health.DefaultTimeout)
 	registry.Register("postgres", db.Ping)
+	// Optional: a Redis outage degrades the service — duplicate detection gets
+	// slower and replays hit the database — but it does not make the process
+	// unable to serve, and deduplication still holds. Marking it required
+	// would withdraw traffic from every replica over a dependency that is not
+	// needed for correctness, turning a partial outage into a total one.
+	registry.RegisterOptional("redis", store.Ping)
 
 	if err := httpapi.New(cfg, log, registry, build).Run(ctx); err != nil {
 		return fmt.Errorf("api server: %w", err)

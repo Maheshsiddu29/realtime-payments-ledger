@@ -62,13 +62,17 @@ logging, concurrency testing, chaos testing, CI/CD.
   Idempotency keys persisted with a UNIQUE constraint, request fingerprinting,
   Redis claim/completion records, duplicate recovery from PostgreSQL, and
   integration tests covering every Redis failure mode.
-- **Phase 4 and later: not started.** Do not begin the next phase without an
+- **Phase 4 — gRPC API and JWT authentication: complete.**
+  Versioned protobuf service, thin handlers over the existing service layer,
+  RS256 token validation, scope-based authorization interceptors, deliberate
+  error mapping, graceful shutdown of both listeners, and gRPC integration
+  tests including twelve concurrent duplicate RPCs.
+- **Phase 5 and later: not started.** Do not begin the next phase without an
   explicit instruction.
 
 Anything not present in the tree is deliberately out of scope for the current
-phase. Do not implement authentication, gRPC, Kafka producers, the outbox,
-observability exporters or chaos testing until the phase that owns them is
-requested.
+phase. Do not implement Kafka producers, the outbox, observability exporters or
+chaos testing until the phase that owns them is requested.
 
 ## 4. Engineering conventions
 
@@ -114,6 +118,19 @@ requested.
 - **Idempotency.** A key is opaque and bounded. Reuse with a different request
   fingerprint is a conflict and must never execute. Completed results may be
   cached; business rejections must not be.
+- **The transport is thin.** gRPC handlers validate, call one service method
+  and convert the result. Never reimplement transfer posting, locking, retry or
+  idempotency in a handler — there must be exactly one implementation.
+- **Security checks precede business code.** Authentication and authorization
+  are interceptors. Never move a scope check into a handler, and never add an
+  RPC without a required-scope mapping: an unmapped RPC is denied, and it must
+  stay that way.
+- **Never hand-roll token cryptography.** Restrict signing algorithms
+  explicitly; never let a token choose its own. Never log a token, an
+  Authorization header or key material, and never tell a client *why*
+  authentication failed.
+- **Generated code is never edited by hand.** Change the `.proto` and run
+  `make proto`; CI verifies the committed output matches.
 
 ## 5. Validation gate
 
@@ -135,6 +152,7 @@ go test ./...
 go test -race ./...
 go test -tags=integration ./...        # needs PostgreSQL and Redis: make infra-up
 go test -race -tags=integration ./...
+make proto-check                       # generated code must be current
 docker compose config                  # must parse
 ```
 

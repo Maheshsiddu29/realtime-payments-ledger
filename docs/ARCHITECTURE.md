@@ -1,9 +1,50 @@
 # Architecture
 
-## Current state (Phase 1)
+## Current state (Phase 4)
 
-The process starts, loads validated configuration, connects to PostgreSQL,
-serves health endpoints, posts double-entry transfers, and shuts down cleanly.
+The process serves a JWT-authenticated gRPC payments API and an HTTP
+operational listener, backed by PostgreSQL and Redis, and shuts both down
+cleanly.
+
+```
+                         Client
+                           │  gRPC + Authorization: Bearer <JWT>
+                           ▼
+              ┌────────────────────────────┐
+              │  logging interceptor       │
+              └─────────────┬──────────────┘
+                            ▼
+              ┌────────────────────────────┐
+              │  authentication interceptor│  RS256, iss/aud/exp/nbf
+              │    fails ⇒ UNAUTHENTICATED │
+              └─────────────┬──────────────┘
+                            ▼
+              ┌────────────────────────────┐
+              │  authorization interceptor │  method → required scope
+              │    fails ⇒ PERMISSION_DENIED
+              └─────────────┬──────────────┘
+                            ▼
+              ┌────────────────────────────┐
+              │  PaymentsService (thin)     │  validate · call · convert
+              └─────────────┬──────────────┘
+                            ▼
+              ┌────────────────────────────┐
+              │  application service layer │  account · transfer · ledger
+              └─────────────┬──────────────┘
+                            ▼
+              ┌────────────────────────────┐
+              │  idempotency coordination  │  SET NX EX · cached results
+              └──────┬──────────────┬──────┘
+                     ▼              ▼
+                 PostgreSQL       Redis
+            (source of truth)  (coordination)
+```
+
+Nothing above the service layer contains business logic: the transport
+validates, calls one service method, and converts the result. There is exactly
+one implementation of a transfer.
+
+## Process lifecycle
 
 ```
                         ┌──────────────────────────────┐
@@ -65,6 +106,7 @@ environment.
 | `cmd/api`           | Entrypoint. Wiring and signal handling only; no business logic.        |
 | `cmd/migrate`       | Applies and reverses schema migrations. Run by an operator, not at boot.|
 | `cmd/stress`        | Development tooling: concurrent load generator. Never deployed.         |
+| `cmd/devtoken`      | Development tooling: mints test JWTs. Never deployed, not an authorization server. |
 | `internal/config`   | Environment parsing, defaulting and validation. The only reader of env.|
 | `internal/database` | Owns the pgx pool: construction, verification, readiness, shutdown.    |
 | `internal/money`    | Currency type and validation. Minor-unit representation rules.         |
@@ -74,6 +116,9 @@ environment.
 | `internal/reconcile`| Verifies stored balances and ledger entries against each other.        |
 | `internal/idempotency`| Key validation, request fingerprints and the Redis coordination record. No financial logic. |
 | `internal/redisclient`| Owns the Redis connection.                                           |
+| `internal/auth`     | JWT verification, the authenticated principal and scopes.              |
+| `internal/grpcapi`  | gRPC transport: service registration, interceptors, error mapping, lifecycle. |
+| `internal/gen`      | Generated protobuf and gRPC code. Never edited by hand.                |
 | `internal/health`   | Concurrency-safe registry of named dependency checks.                  |
 | `internal/httpapi`  | Operational HTTP surface and server lifecycle.                         |
 | `tests`             | End-to-end, integration and concurrency tests.                         |
@@ -148,6 +193,33 @@ the debit always lands on the source, whichever row was locked first.
 Serialization failures are retried under a bounded policy outside the
 transaction. See [CONCURRENCY.md](CONCURRENCY.md).
 
+### The transport is thin, and the security checks precede it
+
+Authentication and authorization are unary interceptors, so both run before any
+handler. That makes "an unauthorized request cannot create financial state" a
+structural property rather than something each handler must remember: a
+rejected call never reaches the idempotency layer, never claims a key, never
+opens a transaction.
+
+The scope policy is a single method-to-scope table. An RPC missing from it is
+denied, so adding an RPC without deciding its permission fails closed, and a
+test walks the generated service descriptor to catch that at build time.
+
+Domain errors are mapped to gRPC codes in one deliberate place. Nothing
+internal — SQLSTATEs, constraint names, driver text, key material — reaches a
+client; unmapped errors become `INTERNAL` with a fixed message and the detail
+goes to the log.
+
+### Two listeners, one lifecycle
+
+HTTP serves operational probes for infrastructure; gRPC serves payments for
+clients. Different audiences, different exposure, different ports. Both are
+started together, both receive the shutdown signal, and the process waits for
+both to drain before the connection pools close — so an in-flight transfer
+finishes committing rather than losing its connection mid-transaction. The gRPC
+stop races `GracefulStop` against the configured budget and falls back to
+`Stop`, so shutdown always terminates.
+
 ### Redis coordinates, PostgreSQL decides
 
 Idempotency is layered so that Redis can fail in any way without permitting a
@@ -195,6 +267,9 @@ Phase 0 had none. Phase 1 adds exactly three direct dependencies:
 | `github.com/google/uuid`          | UUID generation for identifiers.         |
 | `github.com/golang-migrate/migrate/v4` | Schema migrations, used only by `cmd/migrate` and the test harness. |
 | `github.com/redis/go-redis/v9`    | Redis client for idempotency coordination. |
+| `google.golang.org/grpc`          | The API transport.                        |
+| `google.golang.org/protobuf`      | Wire format and generated code runtime.   |
+| `github.com/golang-jwt/jwt/v5`    | JWT verification. Token cryptography is never hand-rolled. |
 
 Structured logging is still `log/slog`, and the HTTP surface is still
 `net/http`.

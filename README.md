@@ -5,11 +5,10 @@ PostgreSQL with serializable transactions, Redis-backed idempotency, a gRPC
 API, a transactional outbox feeding Kafka audit events, and distributed
 tracing.
 
-> **Status: Phase 3 — Redis-backed idempotency.**
-> Accounts, transfers and ledger entries are enforced by the database, transfer
-> posting is hardened against concurrent execution, and repeated payment
-> requests are deduplicated. Kafka, gRPC, authentication and tracing are **not
-> implemented** — see [docs/roadmap.md](docs/roadmap.md).
+> **Status: Phase 4 — gRPC API with JWT authentication.**
+> The ledger is exposed as a versioned gRPC service, secured with RS256 JWT
+> validation and scope-based authorization. Kafka, the transactional outbox and
+> tracing are **not implemented** — see [docs/roadmap.md](docs/roadmap.md).
 
 ## What works today
 
@@ -34,9 +33,17 @@ tracing.
   Redis being unavailable, flushed or expired
 - SHA-256 request fingerprints, so reusing a key for a different payment is
   refused rather than silently returning the first result
+- A versioned **gRPC API** (`payments.v1.PaymentsService`) over the same
+  service layer — the transport adds validation and conversion, nothing else
+- **JWT (RS256) access-token validation** with issuer, audience, expiry and
+  not-before checks and an explicit algorithm allow-list
+- **Scope-based authorization** enforced by an interceptor, so an unauthorized
+  request never reaches business code
+- Deliberate domain-error to gRPC-status mapping that leaks no internals
 
-Not implemented: Kafka, the outbox, gRPC, OAuth2/JWT, OpenTelemetry, Jaeger,
-Loki, Toxiproxy.
+Not implemented: Kafka, the transactional outbox, OpenTelemetry, Jaeger, Loki,
+Toxiproxy. This service **validates** OAuth2-style JWTs; it is **not an OAuth2
+authorization server** — see [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
 
 **Measured, not claimed:** across three separate 1,000-attempt runs plus
 opposing-direction and four-account variants, these runs recorded zero double
@@ -53,6 +60,12 @@ transfer, one debit, one credit and one distinct transfer ID**, with no data
 races. Deliberately removing the database constraint made the same tests
 produce two transfers, which is what shows where the guarantee actually lives.
 See [docs/results/idempotency-concurrency.md](docs/results/idempotency-concurrency.md).
+
+Repeated through the real gRPC transport: 12 simultaneous authenticated
+`CreateTransfer` RPCs sharing one idempotency key produced **one transfer, one
+debit, one credit and one distinct transfer ID** in five consecutive runs under
+the race detector. See
+[docs/results/grpc-idempotency-concurrency.md](docs/results/grpc-idempotency-concurrency.md).
 
 ## Quick start
 
@@ -71,6 +84,22 @@ curl localhost:8080/healthz
 curl localhost:8080/readyz     # 200 once PostgreSQL is reachable
 curl localhost:8080/version
 ```
+
+To call the gRPC API you need a token. `make devtoken` generates a development
+keypair and prints the configuration to use:
+
+```sh
+make devtoken                  # writes ./.devkeys, prints export lines
+# export the printed JWT_ISSUER / JWT_AUDIENCE / JWT_PUBLIC_KEY, then:
+make run
+
+export TOKEN=$(go run ./cmd/devtoken -key ./.devkeys/private.pem -quiet)
+grpcurl -plaintext -H "authorization: Bearer $TOKEN" \
+  -d '{"currency":"USD"}' \
+  localhost:9090 payments.v1.PaymentsService/CreateAccount
+```
+
+Full worked examples: [docs/API.md](docs/API.md).
 
 To run everything, API container included:
 
@@ -111,8 +140,9 @@ Schema reference: [docs/DATABASE.md](docs/DATABASE.md).
 | `/readyz`  | Readiness | Runs every registered check. PostgreSQL is **required** — `503` if it fails. Redis is **optional**: a failure marks the response `degraded` but keeps `200`, because the service stays correct without it. |
 | `/version` | Metadata  | Build version, commit and service identity.                       |
 
-These are the *operational* endpoints. Payment operations are served over gRPC
-from Phase 4 onward; today the ledger is reachable only from Go code and tests.
+These are the *operational* endpoints, on `:8080`. Payment operations are
+served over gRPC on `:9090` — see [docs/API.md](docs/API.md). The standard gRPC
+health service is also registered and needs no token.
 
 ## Money representation
 
@@ -144,6 +174,11 @@ make test-concurrency      # deterministic concurrency tests, verbose
 make test-concurrency-race # the same under the race detector
 make test-idempotency      # Redis idempotency tests
 make test-idempotency-race # the same under the race detector
+make test-grpc             # gRPC transport, authentication, authorization
+make test-grpc-race        # the same under the race detector
+make proto                 # regenerate protobuf code
+make proto-check           # fail if the committed generated code is stale
+make devtoken              # mint a development JWT and print the public key
 make verify                # everything: ci + compose config + integration + race
 make cover-html            # coverage report at coverage.html
 make binary                # build bin/api with version metadata
@@ -201,6 +236,11 @@ Full reference: [docs/configuration.md](docs/configuration.md). Local defaults:
 cmd/api/            Process entrypoint: wiring and signal handling only
 cmd/migrate/        Schema migration runner (operator-run, never at boot)
 cmd/stress/         Concurrent load generator (development tooling)
+cmd/devtoken/       Development JWT minting (never deployed)
+api/proto/          Protobuf service definitions
+internal/gen/       Generated protobuf and gRPC code (committed, CI-verified)
+internal/auth/      JWT verification, principal and scopes
+internal/grpcapi/   gRPC transport: interceptors, handlers, error mapping
 internal/config/    Environment parsing, defaulting and validation
 internal/database/  pgx pool: construction, verification, readiness, shutdown
 internal/money/     Currency type and minor-unit representation rules
@@ -226,6 +266,8 @@ Documentation:
 | [docs/LEDGER_DESIGN.md](docs/LEDGER_DESIGN.md) | Double-entry accounting, money representation, invariants and exactly what enforces each one |
 | [docs/CONCURRENCY.md](docs/CONCURRENCY.md)     | Locking, retries, deadlock prevention, reconciliation and limitations |
 | [docs/IDEMPOTENCY.md](docs/IDEMPOTENCY.md)     | Idempotency keys, fingerprints, Redis state machine, duplicate recovery and failure behaviour |
+| [docs/API.md](docs/API.md)                     | gRPC service, RPCs, money representation, error codes, grpcurl examples |
+| [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) | JWT validation, the OAuth2 relationship, scopes, key configuration, limitations |
 | [docs/results/](docs/results/)                 | Measured stress results, with the environment they came from |
 | [docs/DATABASE.md](docs/DATABASE.md)           | Tables, constraints, indexes, triggers, migrations, transaction boundaries |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)   | Package layout and design decisions                 |
@@ -239,7 +281,7 @@ Documentation:
 | PostgreSQL | `postgres:16-alpine` | 5432      | **Yes** — financial source of truth |
 | Redis      | `redis:7-alpine`     | 6379      | **Yes** — idempotency coordination only |
 | Kafka      | `apache/kafka:3.8.0` | 29092     | No — later phase |
-| API        | built from source    | 8080      | —                |
+| API        | built from source    | 8080 (HTTP), 9090 (gRPC) | — |
 
 Kafka is provisioned so a later phase builds against a stable environment;
 nothing connects to it yet. Redis is used for request coordination and is
@@ -251,10 +293,11 @@ safety, and `/readyz` reports it as `degraded` rather than unready.
 Go · PostgreSQL · Redis · Kafka · gRPC · OAuth2/JWT · OpenTelemetry · Jaeger ·
 Loki · Toxiproxy · Docker Compose · GitHub Actions
 
-Implemented so far: Go, PostgreSQL, Redis, Docker Compose, GitHub Actions.
-Four direct Go dependencies — `pgx/v5`, `google/uuid`, `golang-migrate` and
-`go-redis/v9` — with the standard library covering logging, HTTP, hashing,
-randomness and error handling.
+Implemented so far: Go, PostgreSQL, Redis, gRPC, JWT, Docker Compose, GitHub
+Actions. Seven direct Go dependencies — `pgx/v5`, `google/uuid`,
+`golang-migrate`, `go-redis/v9`, `grpc`, `protobuf` and `golang-jwt/jwt/v5` —
+with the standard library covering logging, HTTP, hashing, randomness and error
+handling.
 
 ## Repository rules
 

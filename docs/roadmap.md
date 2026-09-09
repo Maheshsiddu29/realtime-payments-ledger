@@ -64,11 +64,25 @@ show is the real fix for a hot account.
 
 Design and limitations: [IDEMPOTENCY.md](IDEMPOTENCY.md).
 
-## Phase 4 — gRPC API and authentication
+## Phase 4 — gRPC API and authentication ✅ complete
 
-- gRPC service definitions and server, alongside the existing health listener.
-- OAuth2/JWT validation as a gRPC interceptor, with scope-based authorization.
-- gRPC health service mirroring `/readyz`.
+- Versioned protobuf definitions (`payments.v1`) and a gRPC server alongside
+  the existing HTTP operational listener, on a separate port.
+- Five RPCs: account creation and lookup, transfer creation and lookup, and a
+  read-only ledger query. No RPC can write a ledger entry or set a balance.
+- RS256 JWT validation with an explicit algorithm allow-list, and issuer,
+  audience, expiry and not-before checks.
+- Scope-based authorization from a single method-to-scope table, enforced by an
+  interceptor before any handler runs.
+- Deliberate domain-error to gRPC-status mapping that leaks no internals.
+- Standard gRPC health service reflecting readiness; reflection outside
+  production only.
+- Results: [results/grpc-idempotency-concurrency.md](results/grpc-idempotency-concurrency.md).
+
+Design: [API.md](API.md) and [AUTHENTICATION.md](AUTHENTICATION.md).
+
+This service validates access tokens; it is **not** an OAuth2 authorization
+server. Token issuance is assumed to be an external identity provider.
 
 ## Phase 5 — Transactional outbox and Kafka audit events
 

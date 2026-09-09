@@ -30,6 +30,33 @@ Compose reads `.env` automatically.
 
 Durations use Go syntax: `5s`, `500ms`, `30m`.
 
+## gRPC (application API)
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `GRPC_HOST` | `0.0.0.0` | Bind address. |
+| `GRPC_PORT` | `9090` | Bind port. `0` requests an ephemeral port (tests). Must differ from `HTTP_PORT`. |
+| `GRPC_SHUTDOWN_TIMEOUT` | `15s` | Budget for draining in-flight RPCs before connections are cut. |
+| `GRPC_REFLECTION` | `true` outside production | Server reflection, for `grpcurl`. **Rejected** when `APP_ENV=production`. |
+
+## JWT verification
+
+This service **verifies** access tokens; it never issues them. Only a public
+key is configured, so a compromise here cannot forge a token. See
+[AUTHENTICATION.md](AUTHENTICATION.md).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `JWT_ISSUER` | *(empty)* | Expected `iss` claim. |
+| `JWT_AUDIENCE` | *(empty)* | Expected `aud` claim. |
+| `JWT_PUBLIC_KEY` | *(empty)* | PEM RSA public key, inline. Never logged. |
+| `JWT_PUBLIC_KEY_FILE` | *(empty)* | Path to the PEM key. Mutually exclusive with the above. |
+| `JWT_LEEWAY` | `30s` | Clock-skew tolerance for `exp`/`nbf`. Capped at 5 minutes. |
+
+With no key configured the process still starts, and the authentication
+interceptor **refuses every payments RPC** — a missing key can only close the
+door, never open it.
+
 ## PostgreSQL
 
 Live: the application connects to PostgreSQL using these settings and reports
@@ -111,6 +138,13 @@ Not connected to yet — validated only, for a later phase.
 - `POSTGRES_SSLMODE` is not a valid libpq mode.
 - `POSTGRES_MAX_IDLE_CONNS` exceeds `POSTGRES_MAX_OPEN_CONNS`.
 - `APP_ENV=production` and `POSTGRES_SSLMODE=disable`.
+- `APP_ENV=production` without `JWT_ISSUER`, `JWT_AUDIENCE` and a verification
+  key. There is no development fallback and no default secret.
+- `APP_ENV=production` with `GRPC_REFLECTION=true`.
+- `GRPC_PORT` equal to `HTTP_PORT`.
+- Both `JWT_PUBLIC_KEY` and `JWT_PUBLIC_KEY_FILE` set.
+- `JWT_LEEWAY` greater than 5 minutes — it is a window in which expired tokens
+  are accepted.
 - `KAFKA_BROKERS` resolves to an empty list.
 
 Errors are joined, so one start-up attempt reveals every misconfiguration:
@@ -123,7 +157,8 @@ HTTP_PORT 99999 must be between 0 and 65535
 
 ## Secret handling
 
-Passwords are never written to logs. `Config.Redacted()` returns a copy with
-every secret replaced by `[REDACTED]`, and `Postgres.RedactedDSN()` renders a
+Passwords and key material are never written to logs. `Config.Redacted()`
+returns a copy with every secret — including `JWT_PUBLIC_KEY`, because the same
+field would hold a private key if misconfigured — replaced by `[REDACTED]`, and `Postgres.RedactedDSN()` renders a
 connection string safe to print. An empty password stays empty rather than
 becoming the literal redaction marker.

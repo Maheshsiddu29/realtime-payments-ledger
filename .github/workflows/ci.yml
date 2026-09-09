@@ -42,6 +42,20 @@ jobs:
       - name: go mod tidy is up to date
         run: make tidy-check
 
+      # Generated protobuf code is committed so cloning and building need no
+      # protobuf toolchain. This proves the committed files match the .proto.
+      - name: Install protobuf toolchain
+        run: |
+          PROTOC_VERSION=25.1
+          curl -sSLo /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-linux-x86_64.zip"
+          unzip -q -o /tmp/protoc.zip -d "$HOME/.protoc"
+          echo "$HOME/.protoc/bin" >> "$GITHUB_PATH"
+          make proto-tools
+
+      - name: Generated protobuf code is current
+        run: make proto-check
+
   test:
     name: Build and test
     runs-on: ubuntu-latest
@@ -159,6 +173,11 @@ jobs:
       # between COMMIT and the cache write.
       - name: Redis idempotency tests
         run: make test-idempotency
+
+      # The gRPC transport: authentication, authorization, the API contract,
+      # and the twelve concurrent duplicate requests.
+      - name: gRPC, authentication and authorization tests
+        run: make test-grpc
 
       # Concurrency correctness has to hold under the race detector too. A
       # database serialization conflict is not a Go data race; both must be

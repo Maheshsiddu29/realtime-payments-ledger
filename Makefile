@@ -29,6 +29,16 @@ CONCURRENCY_TESTS := 'TestConcurrent|TestOpposing|TestLockOrder|TestMultiAccount
 # The Redis-backed idempotency tests, including the same-key concurrency case.
 IDEMPOTENCY_TESTS := 'TestSameKey|TestDifferentKeys|TestRetryAfter|TestLostResponse|TestRedis|TestCrash|TestStale|TestPostgresUniquenessAlone|TestRejected|TestInvalidIdempotency|TestIdempotentPosts'
 
+# The gRPC transport tests: authentication, authorization and the API contract.
+GRPC_TESTS := 'TestGRPC'
+
+# Protobuf toolchain. Plugin versions are pinned so generated code is
+# reproducible; they must match the module versions in go.mod.
+PROTOC_GEN_GO_VERSION      := v1.36.12
+PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
+PROTO_FILES := $(shell find api/proto -name '*.proto')
+GOBIN := $(shell go env GOPATH)/bin
+
 # Stress runner defaults, overridable: make stress ATTEMPTS=500 SCENARIO=ring
 ATTEMPTS   ?= 100
 CONCURRENCY ?= 0
@@ -140,6 +150,18 @@ test-idempotency-race:
 	go test -tags=$(INTEGRATION_TAG) -race -count=1 -timeout 20m -v \
 		-run $(IDEMPOTENCY_TESTS) ./tests/
 
+## test-grpc: Run the gRPC transport, authentication and authorization tests.
+.PHONY: test-grpc
+test-grpc:
+	go test -tags=$(INTEGRATION_TAG) -count=1 -timeout 15m -v \
+		-run $(GRPC_TESTS) ./tests/
+
+## test-grpc-race: gRPC tests under the race detector.
+.PHONY: test-grpc-race
+test-grpc-race:
+	go test -tags=$(INTEGRATION_TAG) -race -count=1 -timeout 20m -v \
+		-run $(GRPC_TESTS) ./tests/
+
 ## test-all: Run every suite, fast and integration.
 .PHONY: test-all
 test-all: test test-integration
@@ -181,6 +203,45 @@ run:
 .PHONY: clean
 clean:
 	rm -rf $(BIN_DIR) coverage.out coverage.html
+
+# ---------------------------------------------------------------------------
+# Protobuf
+# ---------------------------------------------------------------------------
+#
+# Generated .pb.go files ARE committed: cloning and building must not require
+# a protobuf toolchain. CI regenerates and diffs to prove they are current.
+
+## proto-tools: Install the pinned protoc plugins.
+.PHONY: proto-tools
+proto-tools:
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+
+## proto: Regenerate Go code from the protobuf definitions.
+.PHONY: proto
+proto:
+	@command -v protoc >/dev/null || { echo "protoc is not installed; see docs/API.md"; exit 1; }
+	PATH="$(GOBIN):$$PATH" protoc \
+		--proto_path=api/proto \
+		--go_out=. --go_opt=module=$(MODULE) \
+		--go-grpc_out=. --go-grpc_opt=module=$(MODULE) \
+		$(PROTO_FILES)
+	@echo "Generated code is in internal/gen/"
+
+## proto-check: Fail if the committed generated code is out of date (used by CI).
+.PHONY: proto-check
+proto-check: proto
+	@if ! git diff --quiet -- internal/gen; then \
+		echo "Generated protobuf code is out of date. Run 'make proto' and commit the result:"; \
+		git --no-pager diff --stat -- internal/gen; \
+		exit 1; \
+	fi
+	@echo "generated protobuf code: up to date"
+
+## devtoken: Mint a development JWT and print the matching public key.
+.PHONY: devtoken
+devtoken:
+	@go run ./cmd/devtoken -out ./.devkeys
 
 # ---------------------------------------------------------------------------
 # Stress and load testing

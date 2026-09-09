@@ -1,0 +1,166 @@
+// Payments ledger API, version 1.
+//
+// Money is ALWAYS an integer count of minor units plus a currency code. There
+// is no floating point anywhere in this API and there never will be: binary
+// floating point cannot represent most decimal fractions exactly, and in a
+// ledger that error compounds into money that does not exist. $10.25 USD is
+// amount_minor = 1025, currency = "USD".
+//
+// Every RPC requires a valid JWT access token and a specific scope; see
+// docs/AUTHENTICATION.md. The service validates tokens, it does not issue
+// them.
+syntax = "proto3";
+
+package payments.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/Maheshsiddu29/realtime-payments-ledger/internal/gen/payments/v1;paymentsv1";
+
+// PaymentsService is the public interface to the ledger.
+//
+// It deliberately exposes no way to set a balance, insert a ledger entry, or
+// modify history. All money movement happens through CreateTransfer, which is
+// the only write path to the ledger.
+service PaymentsService {
+  // CreateAccount opens an account with a zero balance.
+  // Requires scope: accounts:write
+  rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
+
+  // GetAccount returns an account by id.
+  // Requires scope: accounts:read
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+
+  // CreateTransfer moves money between two accounts, at most once per
+  // idempotency key.
+  // Requires scope: transfers:write
+  rpc CreateTransfer(CreateTransferRequest) returns (CreateTransferResponse);
+
+  // GetTransfer returns a transfer by id.
+  // Requires scope: transfers:read
+  rpc GetTransfer(GetTransferRequest) returns (GetTransferResponse);
+
+  // ListLedgerEntriesForTransfer returns the entries a transfer posted.
+  // Read-only: entries are created by CreateTransfer and never by a client.
+  // Requires scope: ledger:read
+  rpc ListLedgerEntriesForTransfer(ListLedgerEntriesForTransferRequest)
+      returns (ListLedgerEntriesForTransferResponse);
+}
+
+// TransferStatus is the lifecycle state of a transfer.
+enum TransferStatus {
+  TRANSFER_STATUS_UNSPECIFIED = 0;
+  // Recorded but not yet posted. Only ever observed inside the posting
+  // transaction, so a client never sees it.
+  TRANSFER_STATUS_PENDING = 1;
+  // The money moved and the ledger entries exist. Immutable.
+  TRANSFER_STATUS_COMPLETED = 2;
+  // Reserved. A rejected transfer currently rolls back entirely and leaves no
+  // row at all, so this is never returned today.
+  TRANSFER_STATUS_FAILED = 3;
+}
+
+// Account is a balance held in exactly one currency.
+message Account {
+  // UUID.
+  string id = 1;
+  // ISO 4217 alphabetic code, upper case, e.g. "USD".
+  string currency = 2;
+  // Balance in minor units. Never negative, never floating point.
+  int64 balance_minor = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+// Transfer is the record of money moving between two accounts.
+message Transfer {
+  // UUID.
+  string id = 1;
+  string source_account_id = 2;
+  string destination_account_id = 3;
+  // Always positive. Direction comes from the account fields, not the sign.
+  int64 amount_minor = 4;
+  string currency = 5;
+  TransferStatus status = 6;
+  google.protobuf.Timestamp created_at = 7;
+  // Set if and only if status is COMPLETED.
+  google.protobuf.Timestamp completed_at = 8;
+}
+
+// LedgerEntry is one signed movement of money against one account.
+//
+// The sign carries the direction: negative is a debit (money leaving),
+// positive is a credit (money arriving). For any one transfer the entries sum
+// to zero.
+message LedgerEntry {
+  string id = 1;
+  string transfer_id = 2;
+  string account_id = 3;
+  // Signed minor units. Negative = debit, positive = credit. Never zero.
+  int64 amount_minor = 4;
+  string currency = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message CreateAccountRequest {
+  // ISO 4217 alphabetic code, exactly three upper-case letters.
+  string currency = 1;
+  // Note: there is deliberately no starting balance field. An account that
+  // came into existence already holding money would be a credit with no
+  // matching debit. Funding is a transfer.
+}
+
+message CreateAccountResponse {
+  Account account = 1;
+}
+
+message GetAccountRequest {
+  string id = 1;
+}
+
+message GetAccountResponse {
+  Account account = 1;
+}
+
+message CreateTransferRequest {
+  string source_account_id = 1;
+  string destination_account_id = 2;
+  // Must be strictly positive.
+  int64 amount_minor = 3;
+  // Must match both accounts' currency. There is no implicit conversion.
+  string currency = 4;
+  // Required. The same key with the same request produces at most one
+  // transfer, however many times it is sent. Reusing a key for a materially
+  // different payment is rejected rather than silently returning the first
+  // result.
+  //
+  // It is a request field rather than metadata because it is business data,
+  // not transport data: it belongs in the audit trail and in the contract a
+  // client codes against.
+  string idempotency_key = 5;
+}
+
+message CreateTransferResponse {
+  Transfer transfer = 1;
+  // True when this response describes a transfer that already existed, i.e.
+  // the request was a duplicate. No money moved for this call.
+  bool idempotent_replay = 2;
+}
+
+message GetTransferRequest {
+  string id = 1;
+}
+
+message GetTransferResponse {
+  Transfer transfer = 1;
+}
+
+message ListLedgerEntriesForTransferRequest {
+  string transfer_id = 1;
+}
+
+message ListLedgerEntriesForTransferResponse {
+  // Debits first. A completed transfer posts exactly two entries in this
+  // phase, so the response is inherently bounded and needs no pagination.
+  repeated LedgerEntry entries = 1;
+}

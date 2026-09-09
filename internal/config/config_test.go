@@ -47,6 +47,13 @@ func TestLoadDefaults(t *testing.T) {
 	if got, want := cfg.Idempotency.ProcessingTTL, 30*time.Second; got != want {
 		t.Errorf("Idempotency.ProcessingTTL = %s, want %s", got, want)
 	}
+	if got, want := cfg.GRPC.Addr(), "0.0.0.0:9090"; got != want {
+		t.Errorf("GRPC.Addr() = %q, want %q", got, want)
+	}
+	// Reflection is convenient in development and is not a production default.
+	if !cfg.GRPC.Reflection {
+		t.Error("GRPC.Reflection = false, want true outside production")
+	}
 	if got, want := len(cfg.Kafka.Brokers), 1; got != want {
 		t.Fatalf("len(Kafka.Brokers) = %d, want %d", got, want)
 	}
@@ -65,6 +72,7 @@ func TestLoadOverrides(t *testing.T) {
 		"LOG_FORMAT":            "TEXT",
 		"HTTP_HOST":             "127.0.0.1",
 		"HTTP_PORT":             "9090",
+		"GRPC_PORT":             "9091",
 		"HTTP_READ_TIMEOUT":     "2s",
 		"HTTP_SHUTDOWN_TIMEOUT": "45s",
 		"POSTGRES_SSLMODE":      "require",
@@ -192,6 +200,26 @@ func TestLoadValidationErrors(t *testing.T) {
 			wantMsg: "must not exceed IDEMPOTENCY_TTL",
 		},
 		{
+			name:    "grpc and http sharing a port",
+			env:     map[string]string{"HTTP_PORT": "8080", "GRPC_PORT": "8080"},
+			wantMsg: "cannot share a port",
+		},
+		{
+			name:    "non-boolean reflection flag",
+			env:     map[string]string{"GRPC_REFLECTION": "yes-please"},
+			wantMsg: "is not a boolean",
+		},
+		{
+			name:    "excessive jwt leeway",
+			env:     map[string]string{"JWT_LEEWAY": "1h"},
+			wantMsg: "JWT_LEEWAY",
+		},
+		{
+			name:    "both jwt key sources",
+			env:     map[string]string{"JWT_PUBLIC_KEY": "x", "JWT_PUBLIC_KEY_FILE": "/tmp/k.pem"},
+			wantMsg: "not both",
+		},
+		{
 			name:    "empty audit topic",
 			env:     map[string]string{"KAFKA_AUDIT_TOPIC": ""},
 			wantMsg: "KAFKA_AUDIT_TOPIC",
@@ -300,5 +328,128 @@ func TestEnvironmentIsProduction(t *testing.T) {
 		if got := env.IsProduction(); got != want {
 			t.Errorf("Environment(%q).IsProduction() = %v, want %v", env, got, want)
 		}
+	}
+}
+
+// Production must never inherit a development-shaped default. A deployment
+// missing its token configuration has to fail at start-up, not serve an
+// unauthenticated payments API.
+func TestProductionRequiresAuthenticationConfiguration(t *testing.T) {
+	t.Parallel()
+
+	production := map[string]string{
+		"APP_ENV":          "production",
+		"POSTGRES_SSLMODE": "require",
+		"GRPC_REFLECTION":  "false",
+	}
+
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantMsg string
+	}{
+		{"no issuer, audience or key", nil, "JWT_ISSUER is required when APP_ENV is production"},
+		{
+			name:    "no audience",
+			env:     map[string]string{"JWT_ISSUER": "https://issuer.example", "JWT_PUBLIC_KEY": "x"},
+			wantMsg: "JWT_AUDIENCE is required",
+		},
+		{
+			name: "no verification key",
+			env: map[string]string{
+				"JWT_ISSUER": "https://issuer.example", "JWT_AUDIENCE": "payments",
+			},
+			wantMsg: "JWT_PUBLIC_KEY or JWT_PUBLIC_KEY_FILE is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			env := map[string]string{}
+			for k, v := range production {
+				env[k] = v
+			}
+			for k, v := range tt.env {
+				env[k] = v
+			}
+
+			_, err := load(envMap(env))
+			if err == nil {
+				t.Fatalf("production configuration %v was accepted, want an error", env)
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("error = %q, want it to mention %q", err, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// Reflection lets anyone enumerate the API. It must not default on in
+// production, and must be rejected if switched on there.
+func TestProductionRejectsReflection(t *testing.T) {
+	t.Parallel()
+
+	env := map[string]string{
+		"APP_ENV":          "production",
+		"POSTGRES_SSLMODE": "require",
+		"JWT_ISSUER":       "https://issuer.example",
+		"JWT_AUDIENCE":     "payments",
+		"JWT_PUBLIC_KEY":   "x",
+	}
+
+	// Default off in production.
+	cfg, err := load(envMap(env))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.GRPC.Reflection {
+		t.Error("GRPC.Reflection defaulted to true in production")
+	}
+
+	// And rejected if enabled explicitly.
+	env["GRPC_REFLECTION"] = "true"
+	if _, err := load(envMap(env)); err == nil {
+		t.Error("production accepted GRPC_REFLECTION=true, want it rejected")
+	}
+}
+
+// A fully configured production environment must load cleanly, or the checks
+// above would be untestable in a real deployment.
+func TestProductionWithCompleteAuthenticationConfigurationLoads(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := load(envMap(map[string]string{
+		"APP_ENV":          "production",
+		"POSTGRES_SSLMODE": "require",
+		"JWT_ISSUER":       "https://issuer.example",
+		"JWT_AUDIENCE":     "payments-api",
+		"JWT_PUBLIC_KEY":   "-----BEGIN PUBLIC KEY-----\nx\n-----END PUBLIC KEY-----",
+	}))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.JWT.Configured() {
+		t.Error("JWT.Configured() = false for a complete production configuration")
+	}
+}
+
+// Key material must never reach a log, even a public key: the same field would
+// hold a private key if it were ever misconfigured.
+func TestRedactedMasksTheVerificationKey(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := load(envMap(map[string]string{"JWT_PUBLIC_KEY": "-----BEGIN PUBLIC KEY-----secret-shaped"}))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	safe := cfg.Redacted()
+	if safe.JWT.PublicKeyPEM != redacted {
+		t.Errorf("JWT.PublicKeyPEM = %q, want %q", safe.JWT.PublicKeyPEM, redacted)
+	}
+	if cfg.JWT.PublicKeyPEM == redacted {
+		t.Error("Redacted() mutated the original configuration")
 	}
 }

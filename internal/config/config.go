@@ -37,6 +37,8 @@ const redacted = "[REDACTED]"
 type Config struct {
 	App         App
 	HTTP        HTTP
+	GRPC        GRPC
+	JWT         JWT
 	Postgres    Postgres
 	Redis       Redis
 	Kafka       Kafka
@@ -64,6 +66,51 @@ type HTTP struct {
 // Addr returns the host:port the HTTP server binds to.
 func (h HTTP) Addr() string {
 	return net.JoinHostPort(h.Host, strconv.Itoa(h.Port))
+}
+
+// GRPC holds the settings for the application API listener.
+//
+// This is a separate listener from HTTP on purpose: HTTP serves operational
+// probes for infrastructure, gRPC serves payments for clients. They have
+// different audiences, different exposure and different failure consequences,
+// so they get different ports.
+type GRPC struct {
+	Host string
+	Port int
+	// ShutdownTimeout bounds the graceful stop. In-flight transfers get this
+	// long to finish before connections are cut.
+	ShutdownTimeout time.Duration
+	// Reflection enables the gRPC server reflection service, which lets tools
+	// such as grpcurl discover the schema. Convenient in development,
+	// unnecessary attack surface in production, so it defaults off there.
+	Reflection bool
+}
+
+// Addr returns the host:port the gRPC server binds to.
+func (g GRPC) Addr() string {
+	return net.JoinHostPort(g.Host, strconv.Itoa(g.Port))
+}
+
+// JWT holds access-token verification settings.
+//
+// This service verifies tokens; it never issues them. Only a public key is
+// configured, so a compromise here cannot forge tokens.
+type JWT struct {
+	// PublicKeyPEM is the PEM-encoded RSA public key. It may be supplied
+	// inline or read from PublicKeyFile. Never logged.
+	PublicKeyPEM string
+	// PublicKeyFile is a path to read the key from, which is how a real
+	// deployment mounts it.
+	PublicKeyFile string
+	Issuer        string
+	Audience      string
+	// Leeway tolerates small clock skew when checking exp and nbf.
+	Leeway time.Duration
+}
+
+// Configured reports whether enough is present to verify tokens.
+func (j JWT) Configured() bool {
+	return j.PublicKeyPEM != "" && j.Issuer != "" && j.Audience != ""
 }
 
 // Postgres holds connection settings for the ledger database.
@@ -144,6 +191,12 @@ func (c Config) Redacted() Config {
 	if out.Redis.Password != "" {
 		out.Redis.Password = redacted
 	}
+	// Key material never reaches a log, even though a public key is not
+	// secret: the same field would hold a private key if it were ever
+	// misconfigured, and that must not be printable.
+	if out.JWT.PublicKeyPEM != "" {
+		out.JWT.PublicKeyPEM = redacted
+	}
 	return out
 }
 
@@ -176,6 +229,10 @@ type lookupFunc func(key string) (string, bool)
 func load(lookup lookupFunc) (Config, error) {
 	e := &env{lookup: lookup}
 
+	// Read the environment first: several defaults depend on it, and a
+	// production deployment must not inherit a development-shaped default.
+	isProduction := Environment(e.str("APP_ENV", string(EnvDevelopment))).IsProduction()
+
 	cfg := Config{
 		App: App{
 			Name:        e.str("APP_NAME", "payments-ledger"),
@@ -190,6 +247,19 @@ func load(lookup lookupFunc) (Config, error) {
 			WriteTimeout:    e.duration("HTTP_WRITE_TIMEOUT", 10*time.Second),
 			IdleTimeout:     e.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 			ShutdownTimeout: e.duration("HTTP_SHUTDOWN_TIMEOUT", 15*time.Second),
+		},
+		GRPC: GRPC{
+			Host:            e.str("GRPC_HOST", "0.0.0.0"),
+			Port:            e.intVal("GRPC_PORT", 9090),
+			ShutdownTimeout: e.duration("GRPC_SHUTDOWN_TIMEOUT", 15*time.Second),
+			Reflection:      e.boolVal("GRPC_REFLECTION", !isProduction),
+		},
+		JWT: JWT{
+			PublicKeyPEM:  e.str("JWT_PUBLIC_KEY", ""),
+			PublicKeyFile: e.str("JWT_PUBLIC_KEY_FILE", ""),
+			Issuer:        e.str("JWT_ISSUER", ""),
+			Audience:      e.str("JWT_AUDIENCE", ""),
+			Leeway:        e.duration("JWT_LEEWAY", 30*time.Second),
 		},
 		Postgres: Postgres{
 			Host:            e.str("POSTGRES_HOST", "localhost"),
@@ -304,6 +374,47 @@ func (c Config) validate() []error {
 		fail("POSTGRES_SSLMODE must not be 'disable' when APP_ENV is production")
 	}
 
+	if c.GRPC.Host == "" {
+		fail("GRPC_HOST must not be empty")
+	}
+	if c.GRPC.Port < 0 || c.GRPC.Port > 65535 {
+		fail("GRPC_PORT %d must be between 0 and 65535", c.GRPC.Port)
+	}
+	if c.GRPC.Port != 0 && c.GRPC.Port == c.HTTP.Port {
+		fail("GRPC_PORT and HTTP_PORT are both %d; the two servers cannot share a port", c.GRPC.Port)
+	}
+	if c.GRPC.ShutdownTimeout <= 0 {
+		fail("GRPC_SHUTDOWN_TIMEOUT must be greater than zero, got %s", c.GRPC.ShutdownTimeout)
+	}
+
+	if c.JWT.Leeway < 0 {
+		fail("JWT_LEEWAY must not be negative, got %s", c.JWT.Leeway)
+	}
+	// Clock skew tolerance is a window in which an expired token still works.
+	if c.JWT.Leeway > 5*time.Minute {
+		fail("JWT_LEEWAY %s is too generous; it is a window in which expired tokens are accepted", c.JWT.Leeway)
+	}
+	if c.JWT.PublicKeyPEM != "" && c.JWT.PublicKeyFile != "" {
+		fail("set JWT_PUBLIC_KEY or JWT_PUBLIC_KEY_FILE, not both")
+	}
+	// Production must never fall back to an unauthenticated API. Development
+	// may run without tokens configured, which is loud in the logs and
+	// rejected at start-up here for any real deployment.
+	if c.App.Environment.IsProduction() {
+		if c.JWT.Issuer == "" {
+			fail("JWT_ISSUER is required when APP_ENV is production")
+		}
+		if c.JWT.Audience == "" {
+			fail("JWT_AUDIENCE is required when APP_ENV is production")
+		}
+		if c.JWT.PublicKeyPEM == "" && c.JWT.PublicKeyFile == "" {
+			fail("JWT_PUBLIC_KEY or JWT_PUBLIC_KEY_FILE is required when APP_ENV is production")
+		}
+		if c.GRPC.Reflection {
+			fail("GRPC_REFLECTION must not be enabled when APP_ENV is production")
+		}
+	}
+
 	if c.Redis.Addr == "" {
 		fail("REDIS_ADDR must not be empty")
 	}
@@ -362,6 +473,19 @@ func (e *env) intVal(key string, def int) int {
 	v, err := strconv.Atoi(raw)
 	if err != nil {
 		e.errs = append(e.errs, fmt.Errorf("%s: %q is not an integer", key, raw))
+		return def
+	}
+	return v
+}
+
+func (e *env) boolVal(key string, def bool) bool {
+	raw, ok := e.lookup(key)
+	if !ok || raw == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		e.errs = append(e.errs, fmt.Errorf("%s: %q is not a boolean (true/false)", key, raw))
 		return def
 	}
 	return v

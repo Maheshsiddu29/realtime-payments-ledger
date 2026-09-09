@@ -11,14 +11,20 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/account"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/auth"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/config"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/database"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/grpcapi"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/health"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/httpapi"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/idempotency"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/ledger"
 	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/redisclient"
+	"github.com/Maheshsiddu29/realtime-payments-ledger/internal/transfer"
 )
 
 // Build metadata, injected at link time by the Makefile.
@@ -107,8 +113,68 @@ func run(ctx context.Context) error {
 	// needed for correctness, turning a partial outage into a total one.
 	registry.RegisterOptional("redis", store.Ping)
 
-	if err := httpapi.New(cfg, log, registry, build).Run(ctx); err != nil {
-		return fmt.Errorf("api server: %w", err)
+	// Authentication. A nil verifier means no key is configured, which
+	// configuration validation permits only outside production; the
+	// interceptor then refuses every payments RPC rather than serving an open
+	// API.
+	verifier, err := auth.VerifierFromConfig(cfg)
+	if err != nil {
+		return err
+	}
+	if verifier == nil {
+		log.WarnContext(ctx, "no JWT verification key configured; every gRPC payments call will be refused",
+			slog.String("environment", string(cfg.App.Environment)))
+	} else {
+		log.InfoContext(ctx, "jwt verification configured",
+			slog.String("issuer", cfg.JWT.Issuer),
+			slog.String("audience", cfg.JWT.Audience),
+			slog.String("algorithm", "RS256"))
+	}
+
+	// The gRPC transport calls exactly the same service layer everything else
+	// does. There is one transfer implementation.
+	payments := grpcapi.NewPaymentsService(
+		account.NewRepository(db.Pool()),
+		transfer.NewService(db.Pool(), log).WithIdempotency(store),
+		ledger.NewRepository(db.Pool()),
+		log,
+	)
+
+	grpcServer := grpcapi.New(cfg, log, payments, verifier, registry)
+	httpServer := httpapi.New(cfg, log, registry, build)
+
+	// Two listeners, one lifecycle. Both are started, both are given the
+	// shutdown signal, and the process waits for both to drain before the
+	// pools close.
+	errs := make(chan error, 2)
+	var servers sync.WaitGroup
+
+	servers.Add(2)
+	go func() {
+		defer servers.Done()
+		if err := grpcServer.Run(ctx); err != nil {
+			errs <- fmt.Errorf("grpc server: %w", err)
+		}
+	}()
+	go func() {
+		defer servers.Done()
+		if err := httpServer.Run(ctx); err != nil {
+			errs <- fmt.Errorf("http server: %w", err)
+		}
+	}()
+
+	log.InfoContext(ctx, "servers started",
+		slog.String("http_addr", cfg.HTTP.Addr()),
+		slog.String("grpc_addr", cfg.GRPC.Addr()))
+
+	servers.Wait()
+	close(errs)
+
+	// Report the first failure, if either server failed.
+	for err := range errs {
+		if err != nil {
+			return err
+		}
 	}
 
 	log.InfoContext(ctx, "shutdown complete")

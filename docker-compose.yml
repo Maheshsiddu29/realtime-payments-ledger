@@ -137,6 +137,18 @@ services:
       HTTP_HOST: 0.0.0.0
       HTTP_PORT: 8080
       HTTP_SHUTDOWN_TIMEOUT: ${HTTP_SHUTDOWN_TIMEOUT:-15s}
+      # The application API. Separate from the operational HTTP listener: the
+      # two have different audiences and different exposure.
+      GRPC_HOST: 0.0.0.0
+      GRPC_PORT: 9090
+      GRPC_SHUTDOWN_TIMEOUT: ${GRPC_SHUTDOWN_TIMEOUT:-15s}
+      GRPC_REFLECTION: ${GRPC_REFLECTION:-true}
+      # JWT verification. Unset by default, which makes every payments RPC
+      # refuse rather than serve an open API; supply a public key to use it.
+      # See docs/AUTHENTICATION.md and `make devtoken`.
+      JWT_ISSUER: ${JWT_ISSUER:-}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:-}
       # Service names, not localhost: these resolve on the Compose network.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
@@ -154,8 +166,10 @@ services:
       KAFKA_AUDIT_TOPIC: ${KAFKA_AUDIT_TOPIC:-ledger.audit.v1}
     ports:
       - "${HTTP_PORT:-8080}:8080"
+      - "${GRPC_PORT:-9090}:9090"
     # SIGTERM must reach the process so graceful shutdown runs; the default
-    # 10s grace period would cut a 15s drain short.
+    # 10s grace period would cut a 15s drain short. Both listeners drain
+    # within it.
     stop_grace_period: 30s
 
 volumes:
